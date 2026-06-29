@@ -68,26 +68,24 @@ def _get(endpoint: str, params: dict) -> dict:
 #  resultados recientes para calcular forma.
 # ══════════════════════════════════════════
 
-def _descargar_ventana_fechas(dias_atras: int = 14, dias_adelante: int = 7) -> list[dict]:
+def _descargar_ventana_fechas(dias_atras: int = 5, dias_adelante: int = 2) -> list[dict]:
     """
-    Descarga todos los fixtures de una ventana de fechas usando
-    el endpoint /fixtures?date=... (único permitido en plan Free).
-    Retorna lista plana de fixtures (crudos de la API).
+    Descarga fixtures de una ventana reducida para ahorrar peticiones.
+    Plan Free = 100 req/día; con 7 días usamos 7 req (antes usábamos 22).
+    - dias_atras=5  → forma reciente de los últimos partidos
+    - dias_adelante=2 → hoy + mañana
     """
     today = datetime.now(timezone.utc).date()
     todos = []
-    fechas = []
-    for d in range(-dias_atras, dias_adelante + 1):
-        fechas.append(today + timedelta(days=d))
+    fechas = [today + timedelta(days=d) for d in range(-dias_atras, dias_adelante + 1)]
 
     log.info(f"Descargando ventana {fechas[0]} → {fechas[-1]} ({len(fechas)} días)…")
     for dia in fechas:
         data = _get("fixtures", {"date": str(dia)})
         fixtures = data.get("response", [])
         todos.extend(fixtures)
-        time.sleep(0.25)
+        time.sleep(0.3)
 
-    # Filtrar solo ligas permitidas
     filtrados = [f for f in todos if f.get("league", {}).get("id") in LIGAS_PERMITIDAS]
     log.info(f"  Total fixtures ventana: {len(todos)} | en ligas permitidas: {len(filtrados)}")
     return filtrados
