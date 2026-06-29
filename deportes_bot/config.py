@@ -17,6 +17,7 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 THE_ODDS_API_KEY   = os.getenv("THE_ODDS_API_KEY", "").strip()
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL       = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+OPENWEATHER_KEY    = os.getenv("OPENWEATHER_KEY", "").strip()   # opcional — gratis en openweathermap.org
 
 # ─────────────────────────────────────────
 #  MODO DE EJECUCIÓN
