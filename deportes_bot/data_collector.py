@@ -173,6 +173,35 @@ def _default_form() -> dict:
     return {"gf": 1.2, "gc": 1.0, "forma": ""}
 
 
+def _default_form_partido() -> dict:
+    return {
+        "cuota_local": 2.0, "cuota_empate": 3.3, "cuota_visitante": 3.5,
+        "gf_local_5j": 1.2, "gc_local_5j": 1.0,
+        "gf_visitante_5j": 1.0, "gc_visitante_5j": 1.2,
+        "forma_local": "", "forma_visitante": "", "h2h_historial": "H0-D0-A0",
+        "cons_prob_local": None, "cons_prob_empate": None, "cons_prob_visitante": None,
+        "n_bookmakers": 0,
+    }
+
+
+def _check_api_football() -> bool:
+    """Devuelve True si API-Football responde sin errores de suspensión/acceso."""
+    if not API_FOOTBALL_KEY:
+        return False
+    try:
+        headers = {"x-apisports-key": API_FOOTBALL_KEY}
+        r = requests.get(f"{API_FOOTBALL_BASE}/status", headers=headers, timeout=8)
+        data = r.json()
+        errors = data.get("errors", {})
+        if errors:
+            log.warning(f"API-Football no disponible: {errors}")
+            return False
+        return True
+    except Exception as e:
+        log.warning(f"API-Football check falló: {e}")
+        return False
+
+
 def _parse_fixture(fix: dict) -> dict:
     f  = fix.get("fixture", {})
     l  = fix.get("league",  {})
@@ -330,55 +359,88 @@ def recolectar_datos() -> pd.DataFrame:
         for liga_id in LIGAS_PERMITIDAS:
             odds_cache[liga_id] = _get_odds_for_liga(liga_id)
 
-        # ── 2. Descarga ventana de fechas (una sola pasada) ──
-        todos_fixtures = _descargar_ventana_fechas(dias_atras=14, dias_adelante=7)
-        cache = _build_team_stats_cache(todos_fixtures)
-        upcoming = cache["upcoming"]
-        team_stats = cache["teams"]
-        h2h_map   = cache["h2h"]
+        # ── 2. Comprobar si API-Football está disponible ──
+        api_fb_ok = _check_api_football()
 
-        log.info(f"Próximos partidos en ligas permitidas: {len(upcoming)}")
-        if not upcoming:
-            log.warning("No hay partidos próximos. Comprueba LIGAS_PERMITIDAS y las fechas.")
+        if api_fb_ok:
+            # Modo normal: API-Football para fixtures + forma
+            todos_fixtures = _descargar_ventana_fechas(dias_atras=5, dias_adelante=2)
+            cache      = _build_team_stats_cache(todos_fixtures)
+            upcoming   = cache["upcoming"]
+            team_stats = cache["teams"]
+            h2h_map    = cache["h2h"]
+            log.info(f"Próximos partidos en ligas permitidas: {len(upcoming)}")
+        else:
+            # Fallback: construir partidos directamente desde The Odds API
+            log.warning("API-Football no disponible → usando The Odds API como fuente de partidos")
+            upcoming   = []
+            team_stats = {}
+            h2h_map    = {}
+            for liga_id, eventos in odds_cache.items():
+                for ev in eventos:
+                    # Fabricar un fixture sintético compatible con _parse_fixture
+                    upcoming.append({
+                        "_from_odds": True,
+                        "liga_id":   liga_id,
+                        "home_team": ev.get("home_team", ""),
+                        "away_team": ev.get("away_team", ""),
+                        "commence_time": ev.get("commence_time", ""),
+                    })
+            log.info(f"Partidos desde The Odds API: {len(upcoming)}")
 
         partidos = []
         for fix in upcoming:
-            p = _parse_fixture(fix)
-            home_id = p["equipo_local_id"]
-            away_id = p["equipo_visitante_id"]
+            # Fixture sintético de The Odds API
+            if fix.get("_from_odds"):
+                from datetime import datetime as _dt
+                try:
+                    dt = _dt.fromisoformat(fix["commence_time"].replace("Z", "+00:00"))
+                except Exception:
+                    dt = datetime.now(timezone.utc)
+                liga_id = fix["liga_id"]
+                p = {
+                    "fixture_id":          None,
+                    "fecha":               dt.strftime("%Y-%m-%d"),
+                    "hora":                dt.strftime("%H:%M"),
+                    "liga_id":             liga_id,
+                    "liga_nombre":         LIGAS.get(liga_id, ""),
+                    "equipo_local_id":     0,
+                    "equipo_local":        fix["home_team"],
+                    "equipo_visitante_id": 0,
+                    "equipo_visitante":    fix["away_team"],
+                    **_default_form_partido(),
+                }
+            else:
+                p = _parse_fixture(fix)
+                home_id = p["equipo_local_id"]
+                away_id = p["equipo_visitante_id"]
+                fh = team_stats.get(home_id, _default_form())
+                p["gf_local_5j"]      = fh["gf"]
+                p["gc_local_5j"]      = fh["gc"]
+                p["forma_local"]      = fh["forma"]
+                fa = team_stats.get(away_id, _default_form())
+                p["gf_visitante_5j"]  = fa["gf"]
+                p["gc_visitante_5j"]  = fa["gc"]
+                p["forma_visitante"]  = fa["forma"]
+                p["h2h_historial"]    = h2h_map.get((home_id, away_id), "H0-D0-A0")
+
             liga_id = p["liga_id"]
-
-            # Forma local
-            fh = team_stats.get(home_id, _default_form())
-            p["gf_local_5j"]  = fh["gf"]
-            p["gc_local_5j"]  = fh["gc"]
-            p["forma_local"]  = fh["forma"]
-
-            # Forma visitante
-            fa = team_stats.get(away_id, _default_form())
-            p["gf_visitante_5j"]  = fa["gf"]
-            p["gc_visitante_5j"]  = fa["gc"]
-            p["forma_visitante"]  = fa["forma"]
-
-            # H2H
-            p["h2h_historial"] = h2h_map.get((home_id, away_id), "H0-D0-A0")
-
-            # Cuotas
-            cuotas = _match_odds(p["equipo_local"], p["equipo_visitante"],
-                                 odds_cache.get(liga_id, []))
+            cuotas  = _match_odds(p["equipo_local"], p["equipo_visitante"],
+                                  odds_cache.get(liga_id, []))
             if cuotas:
-                p["cuota_local"]          = cuotas.get("local")
-                p["cuota_empate"]         = cuotas.get("empate")
-                p["cuota_visitante"]      = cuotas.get("visitante")
-                p["cons_prob_local"]      = cuotas.get("cons_prob_local")
-                p["cons_prob_empate"]     = cuotas.get("cons_prob_empate")
-                p["cons_prob_visitante"]  = cuotas.get("cons_prob_visitante")
-                p["n_bookmakers"]         = cuotas.get("n_bookmakers", 1)
-                log.info(f"  {p['equipo_local']} best={cuotas.get('local')} cons_p={cuotas.get('cons_prob_local'):.1%} | "
+                p["cuota_local"]         = cuotas.get("local")
+                p["cuota_empate"]        = cuotas.get("empate")
+                p["cuota_visitante"]     = cuotas.get("visitante")
+                p["cons_prob_local"]     = cuotas.get("cons_prob_local")
+                p["cons_prob_empate"]    = cuotas.get("cons_prob_empate")
+                p["cons_prob_visitante"] = cuotas.get("cons_prob_visitante")
+                p["n_bookmakers"]        = cuotas.get("n_bookmakers", 1)
+                log.info(f"  {p['equipo_local']} best={cuotas.get('local')} "
+                         f"cons_p={cuotas.get('cons_prob_local'):.1%} | "
                          f"X best={cuotas.get('empate')} | "
-                         f"{p['equipo_visitante']} best={cuotas.get('visitante')} cons_p={cuotas.get('cons_prob_visitante'):.1%} | "
-                         f"N bookmakers={cuotas.get('n_bookmakers')} | "
-                         f"forma_h='{p['forma_local']}' forma_a='{p['forma_visitante']}'")
+                         f"{p['equipo_visitante']} best={cuotas.get('visitante')} "
+                         f"cons_p={cuotas.get('cons_prob_visitante'):.1%} | "
+                         f"N bookmakers={cuotas.get('n_bookmakers')}")
             else:
                 log.warning(f"  Sin cuotas: {p['equipo_local']} vs {p['equipo_visitante']}")
 
