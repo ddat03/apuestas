@@ -10,13 +10,13 @@ load_dotenv()
 # ─────────────────────────────────────────
 #  API KEYS
 # ─────────────────────────────────────────
-API_FOOTBALL_KEY   = os.getenv("API_FOOTBALL_KEY", "")
-RAPIDAPI_KEY       = os.getenv("RAPIDAPI_KEY", "")
-TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
-THE_ODDS_API_KEY   = os.getenv("THE_ODDS_API_KEY", "")
-OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL       = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+API_FOOTBALL_KEY   = os.getenv("API_FOOTBALL_KEY", "").strip()
+RAPIDAPI_KEY       = os.getenv("RAPIDAPI_KEY", "").strip()
+TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+THE_ODDS_API_KEY   = os.getenv("THE_ODDS_API_KEY", "").strip()
+OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL       = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
 # ─────────────────────────────────────────
 #  MODO DE EJECUCIÓN
