@@ -1,0 +1,52 @@
+name: Análisis Deportivo Diario
+
+on:
+  schedule:
+    # Corre cada día a las 12:00 UTC = 9:00 AM hora Colombia/México
+    # Ajusta según tu zona horaria:
+    #   UTC-5 (Colombia/Perú): usa "0 14 * * *" para las 9am local
+    #   UTC-6 (México):        usa "0 15 * * *" para las 9am local
+    #   UTC-3 (Argentina):     usa "0 12 * * *" para las 9am local
+    - cron: '0 14 * * *'
+
+  # También puedes dispararlo manualmente desde GitHub
+  workflow_dispatch:
+
+jobs:
+  predict:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Instalar dependencias
+        run: |
+          cd deportes_bot
+          pip install -r requirements.txt
+
+      - name: Ejecutar análisis diario
+        env:
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+          THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          OPENAI_API_KEY:   ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          cd deportes_bot
+          python main.py --mode predict
+
+      - name: Subir logs como artefacto
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.run_id }}
+          path: deportes_bot/logs/sistema.log
+          retention-days: 7

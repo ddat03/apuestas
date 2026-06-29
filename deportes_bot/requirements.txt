@@ -1,0 +1,23 @@
+# ─── Core ────────────────────────────────
+requests==2.31.0
+pandas==2.2.0
+numpy==1.26.4
+python-dotenv==1.0.0
+
+# ─── Machine Learning ────────────────────
+scikit-learn==1.4.0
+
+# ─── Base de datos ───────────────────────
+sqlalchemy==2.0.29
+
+# ─── Visualización ───────────────────────
+plotly==5.20.0
+
+# ─── Telegram ────────────────────────────
+python-telegram-bot==21.0.1
+
+# ─── IA ──────────────────────────────────
+openai>=1.0.0
+
+# ─── Scheduler (automatización) ──────────
+schedule==1.2.1

@@ -1,0 +1,21 @@
+# Nunca subir las API keys
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# Datos generados (no son código)
+deportes_bot/data/
+deportes_bot/logs/
+deportes_bot/models/
+deportes_bot/reports/
+
+# Sistema
+.DS_Store
+Thumbs.db
