@@ -124,32 +124,50 @@ def modo_predict(bankroll: float = BANKROLL_INICIAL,
     df_analisis = analizar_todos(df_partidos, bankroll=bankroll)
     _imprimir_resumen(df_analisis)
 
-    # ── 4. Análisis IA (OpenAI) ───────────────────────────
+    # ── 4. Sentimiento / Noticias ─────────────────────────
+    from sentiment_analyzer import analizar_sentimiento, resumen_para_prompt
+    log.info("[4/5] Buscando noticias pre-partido…")
+    noticias_por_partido: dict[str, str] = {}
+    liga_nombre = df_partidos.iloc[0].get("liga_nombre", "") if not df_partidos.empty else ""
+    for _, row in df_partidos.iterrows():
+        partido = f"{row.get('equipo_local','')} vs {row.get('equipo_visitante','')}"
+        sent = analizar_sentimiento(
+            row.get("equipo_local", ""),
+            row.get("equipo_visitante", ""),
+            liga=liga_nombre,
+            usar_ia=False,  # IA para esto ya gasta tokens; usamos resumen simple
+        )
+        resumen = resumen_para_prompt(sent)
+        if "Sin datos" not in resumen:
+            noticias_por_partido[partido] = resumen
+            log.info(f"  Noticias {partido}: alertas={len(sent.alertas)}")
+
+    # ── 5. Análisis IA (OpenAI) ───────────────────────────
     analisis_ia = {}
     msg_ia      = ""
     if usar_ia and os.getenv("OPENAI_API_KEY", ""):
-        log.info("[4/5] Analizando con OpenAI…")
+        log.info("[5/5a] Analizando con OpenAI…")
         analisis_ia = analizar_con_ia(
             df_partidos.to_dict("records"),
             lista_mercados_dict,
             bankroll=bankroll,
             max_apuesta=bankroll * 0.05,
+            noticias_por_partido=noticias_por_partido,
         )
         msg_ia = formatear_analisis_ia(analisis_ia)
         print("\n" + msg_ia)
     else:
-        log.info("[4/5] IA omitida (sin OPENAI_API_KEY)")
+        log.info("[5/5a] IA omitida (sin OPENAI_API_KEY)")
 
-    # ── 5. Telegram (UN solo mensaje) ────────────────────
+    # ── 5b. Telegram (UN solo mensaje) ───────────────────
     if enviar_telegram:
-        log.info("[5/5] Enviando Telegram…")
+        log.info("[5/5b] Enviando Telegram…")
         if msg_ia:
             enviar_mensaje(msg_ia)
         else:
-            # Fallback si OpenAI no está disponible
             enviar_recomendaciones_diarias(df_analisis)
     else:
-        log.info("[5/5] Telegram desactivado")
+        log.info("[5/5b] Telegram desactivado")
 
     return df_analisis, analisis_ia
 

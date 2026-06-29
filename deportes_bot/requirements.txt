@@ -11,8 +11,9 @@ scikit-learn==1.4.0
 # ─── Base de datos ───────────────────────
 sqlalchemy==2.0.29
 
-# ─── Visualización ───────────────────────
+# ─── Visualización y dashboard ───────────
 plotly==5.20.0
+streamlit>=1.35.0
 
 # ─── Telegram ────────────────────────────
 python-telegram-bot==21.0.1

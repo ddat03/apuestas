@@ -54,7 +54,8 @@ MERCADOS QUE PUEDES ESTIMAR (aunque no tengas datos de API):
 IMPORTANTE: Responde SIEMPRE con JSON válido exactamente con la estructura pedida."""
 
 
-def _build_partido_context(partido: dict, mercados: dict) -> str:
+def _build_partido_context(partido: dict, mercados: dict,
+                           noticia: str = "") -> str:
     """Construye el bloque de texto de un partido para el prompt."""
     home = partido.get("equipo_local", "")
     away = partido.get("equipo_visitante", "")
@@ -62,9 +63,12 @@ def _build_partido_context(partido: dict, mercados: dict) -> str:
     lines = [
         f"PARTIDO: {home} vs {away}",
         f"Competición: {partido.get('liga_nombre','')} | Fecha: {partido.get('fecha','')} {partido.get('hora','')}",
-        "",
-        "PROBABILIDADES CONSENSO DEL MERCADO (sin margen de casa):",
     ]
+
+    if noticia:
+        lines += ["", "NOTICIAS PRE-PARTIDO (considera esto al estimar probabilidades):", noticia]
+
+    lines += ["", "PROBABILIDADES CONSENSO DEL MERCADO (sin margen de casa):"]
 
     # H2H — mostrar solo la probabilidad, que es lo que importa
     h2h = mercados.get("h2h", {})
@@ -213,15 +217,20 @@ def analizar_con_ia(
     mercados: list[dict],
     bankroll: float = 100.0,
     max_apuesta: float = 5.0,
+    noticias_por_partido: dict | None = None,
 ) -> dict:
     if not _OPENAI_AVAILABLE:
         return {"error": "openai no instalado. pip install openai"}
     if not OPENAI_API_KEY:
         return {"error": "OPENAI_API_KEY no configurada en .env"}
 
+    noticias_por_partido = noticias_por_partido or {}
+
     partidos_ctx = []
     for partido, mercado in zip(partidos, mercados):
-        ctx = _build_partido_context(partido, mercado)
+        key    = f"{partido.get('equipo_local','')} vs {partido.get('equipo_visitante','')}"
+        noticia = noticias_por_partido.get(key, "")
+        ctx    = _build_partido_context(partido, mercado, noticia=noticia)
         partidos_ctx.append(f"{'─'*50}\n{ctx}")
 
     user_prompt = USER_PROMPT_TEMPLATE.format(
@@ -251,8 +260,9 @@ def analizar_con_ia(
         costo    = tokens / 1_000_000 * 0.60
         log.info(f"✓ OpenAI | tokens={tokens} | costo≈${costo:.4f}")
 
-        # Post-proceso: filtrar cualquier selección < 60% que haya pasado el filtro
         resultado = _filtrar_baja_probabilidad(resultado)
+        # Guardar noticias resumen para el mensaje Telegram
+        resultado["_noticias_resumen"] = _resumir_noticias(noticias_por_partido)
         return resultado
 
     except json.JSONDecodeError as e:
@@ -295,6 +305,17 @@ def _producto(valores: list[float]) -> float:
     for v in valores:
         r *= v
     return r
+
+
+def _resumir_noticias(noticias_por_partido: dict) -> str:
+    """Compacta todas las noticias en un bloque para el mensaje Telegram."""
+    if not noticias_por_partido:
+        return ""
+    lineas = []
+    for partido, texto in noticias_por_partido.items():
+        if texto.strip():
+            lineas.append(f"*{partido}*\n{texto.strip()}")
+    return "\n\n".join(lineas)
 
 
 # ══════════════════════════════════════════
@@ -351,6 +372,14 @@ def formatear_analisis_ia(analisis: dict) -> str:
             lines.append(f"   _Ganarías ${ganancia:.2f} si aciertas las {len(patas)} patas_")
             lines.append(f"   _{comb.get('razon', '')}_")
             lines.append("")
+
+    # ── Sección de noticias ───────────────────────────────
+    noticias = analisis.get("_noticias_resumen", "")
+    if noticias:
+        lines += ["", "─" * 30, "", "📰 *NOTICIAS PRE-PARTIDO*", ""]
+        for linea in noticias.split("\n"):
+            lines.append(linea)
+        lines.append("")
 
     lines.append("_Solo análisis. Tú decides si apostar._")
     return "\n".join(lines)

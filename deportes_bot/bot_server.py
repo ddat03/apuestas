@@ -50,89 +50,172 @@ log = logging.getLogger("BotServer")
 #  HANDLERS DE COMANDOS
 # ══════════════════════════════════════════
 
+def _build_keyboard(partidos_lista: list[str], seleccionados: set[int]) -> list:
+    """Construye el teclado inline con un botón por partido."""
+    from telegram import InlineKeyboardButton
+    keyboard = []
+    for i, nombre in enumerate(partidos_lista):
+        marca = "✅ " if i in seleccionados else ""
+        keyboard.append([InlineKeyboardButton(
+            text=f"{marca}{nombre}",
+            callback_data=f"toggle_{i}",
+        )])
+    keyboard.append([InlineKeyboardButton(
+        text=f"🎯 Analizar ({len(seleccionados)} seleccionados)",
+        callback_data="confirmar",
+    )])
+    return keyboard
+
+
 async def cmd_analizar(update, ctx):
     """
-    /analizar — Corre el pipeline completo y responde con las mejores apuestas.
-    Puede tardar 30-60 segundos porque descarga datos en tiempo real.
+    /analizar — Muestra los partidos del día como botones.
+    El usuario selecciona cuáles analizar y presiona Confirmar.
     """
     chat_id = update.effective_chat.id
-
-    # Solo responder al chat autorizado
     if str(chat_id) != str(TELEGRAM_CHAT_ID):
         await update.message.reply_text("No autorizado.")
         return
 
-    await update.message.reply_text(
-        "⏳ Analizando partidos en tiempo real...\n"
-        "Descargando cuotas de 25 bookmakers + análisis IA.\n"
-        "Espera ~30 segundos."
-    )
+    await update.message.reply_text("⏳ Cargando partidos de hoy…")
 
     try:
         from data_collector    import recolectar_datos
-        from value_analyzer    import analizar_todos
-        from markets_collector import recolectar_mercados, mercados_a_dict, descargar_todos_mercados
-        from ai_analyzer       import analizar_con_ia, formatear_analisis_ia
+        from markets_collector import descargar_todos_mercados, recolectar_mercados, mercados_a_dict
         from config            import LIGAS_PERMITIDAS
+        from telegram          import InlineKeyboardMarkup
 
-        # 1. Partidos
-        df_partidos = recolectar_datos()
-        if df_partidos.empty:
-            await update.message.reply_text("ℹ️ Sin partidos próximos encontrados.")
+        df = recolectar_datos()
+        if df.empty:
+            await ctx.bot.send_message(chat_id=chat_id,
+                                       text="ℹ️ Sin partidos próximos hoy.")
             return
 
-        n = len(df_partidos)
+        # Guardar en user_data para el callback
+        partidos_lista = [
+            f"{r.get('equipo_local','')} vs {r.get('equipo_visitante','')}"
+            for _, r in df.iterrows()
+        ]
+        cache_liga = {lid: descargar_todos_mercados(lid) for lid in LIGAS_PERMITIDAS}
+        mercados_lista = []
+        for _, row in df.iterrows():
+            lid = int(row.get("liga_id", 1))
+            pm  = recolectar_mercados(row.to_dict(), lid,
+                                      eventos_cache=cache_liga.get(lid, []))
+            mercados_lista.append(mercados_a_dict(pm))
+
+        ctx.user_data["df_partidos"]    = df
+        ctx.user_data["partidos_lista"] = partidos_lista
+        ctx.user_data["mercados_lista"] = mercados_lista
+        ctx.user_data["seleccionados"]  = set(range(len(partidos_lista)))  # todos por defecto
+
+        keyboard = _build_keyboard(partidos_lista, ctx.user_data["seleccionados"])
         await ctx.bot.send_message(
             chat_id=chat_id,
-            text=f"✅ {n} partidos encontrados. Descargando mercados..."
+            text="*Selecciona los partidos a analizar:*\n_(toca para marcar/desmarcar)_",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard),
         )
-
-        # 2. Mercados adicionales
-        cache_por_liga = {
-            liga_id: descargar_todos_mercados(liga_id)
-            for liga_id in LIGAS_PERMITIDAS
-        }
-        lista_mercados_dict = []
-        for _, row in df_partidos.iterrows():
-            liga_id = int(row.get("liga_id", 1))
-            pm = recolectar_mercados(row.to_dict(), liga_id,
-                                     eventos_cache=cache_por_liga.get(liga_id, []))
-            lista_mercados_dict.append(mercados_a_dict(pm))
-
-        # 3. Análisis Sharp
-        df_analisis = analizar_todos(df_partidos, bankroll=BANKROLL_INICIAL)
-
-        # 4. Análisis IA
-        openai_key = os.getenv("OPENAI_API_KEY", "")
-        if openai_key:
-            await ctx.bot.send_message(chat_id=chat_id, text="🤖 Generando análisis IA...")
-            analisis_ia = analizar_con_ia(
-                df_partidos.to_dict("records"),
-                lista_mercados_dict,
-                bankroll=BANKROLL_INICIAL,
-                max_apuesta=BANKROLL_INICIAL * 0.05,
-            )
-            mensaje = formatear_analisis_ia(analisis_ia)
-        else:
-            # Fallback: mensaje Sharp sin IA
-            from telegram_bot import formatear_mensaje_diario
-            mensaje = formatear_mensaje_diario(df_analisis)
-
-        # 5. Enviar resultado
-        from telegram import constants
-        for i in range(0, len(mensaje), 4000):
-            await ctx.bot.send_message(
-                chat_id=chat_id,
-                text=mensaje[i:i+4000],
-                parse_mode=constants.ParseMode.MARKDOWN,
-            )
-
-        hora = datetime.now().strftime("%H:%M")
-        log.info(f"✓ /analizar completado a las {hora}")
 
     except Exception as e:
         log.error(f"Error en /analizar: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Error al analizar: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
+async def callback_seleccion(update, ctx):
+    """Maneja los botones de selección de partidos."""
+    query   = update.callback_query
+    chat_id = query.message.chat_id
+    await query.answer()
+
+    if str(chat_id) != str(TELEGRAM_CHAT_ID):
+        return
+
+    data = query.data
+
+    if data.startswith("toggle_"):
+        idx = int(data.split("_")[1])
+        sel = ctx.user_data.get("seleccionados", set())
+        if idx in sel:
+            sel.discard(idx)
+        else:
+            sel.add(idx)
+        ctx.user_data["seleccionados"] = sel
+
+        from telegram import InlineKeyboardMarkup
+        keyboard = _build_keyboard(ctx.user_data["partidos_lista"], sel)
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    if data == "confirmar":
+        sel            = ctx.user_data.get("seleccionados", set())
+        partidos_lista = ctx.user_data.get("partidos_lista", [])
+        df_todos       = ctx.user_data.get("df_partidos")
+        mercados_todos = ctx.user_data.get("mercados_lista", [])
+
+        if not sel:
+            await query.edit_message_text("⚠️ Selecciona al menos un partido.")
+            return
+
+        await query.edit_message_text(
+            f"⏳ Analizando {len(sel)} partido(s)…\nEspera ~30 segundos."
+        )
+
+        try:
+            import pandas as pd
+            from value_analyzer import analizar_todos
+            from ai_analyzer    import analizar_con_ia, formatear_analisis_ia
+            from sentiment_analyzer import analizar_sentimiento, resumen_para_prompt
+            from config         import LIGAS_PERMITIDAS
+
+            indices = sorted(sel)
+            df_sel  = df_todos.iloc[indices].copy()
+            merc_sel= [mercados_todos[i] for i in indices]
+
+            # Noticias
+            noticias_ctx = {}
+            liga = df_sel.iloc[0].get("liga_nombre", "") if not df_sel.empty else ""
+            for _, row in df_sel.iterrows():
+                key  = f"{row.get('equipo_local','')} vs {row.get('equipo_visitante','')}"
+                sent = analizar_sentimiento(row.get("equipo_local",""),
+                                            row.get("equipo_visitante",""),
+                                            liga=liga, usar_ia=False)
+                if sent.disponible:
+                    noticias_ctx[key] = resumen_para_prompt(sent)
+
+            # Análisis Sharp
+            df_analisis = analizar_todos(df_sel, bankroll=BANKROLL_INICIAL)
+
+            # Análisis IA
+            from telegram import constants
+            openai_key = os.getenv("OPENAI_API_KEY", "")
+            if openai_key:
+                analisis_ia = analizar_con_ia(
+                    df_sel.to_dict("records"),
+                    merc_sel,
+                    bankroll=BANKROLL_INICIAL,
+                    max_apuesta=BANKROLL_INICIAL * 0.05,
+                    noticias_por_partido=noticias_ctx,
+                )
+                mensaje = formatear_analisis_ia(analisis_ia)
+            else:
+                from telegram_bot import formatear_mensaje_diario
+                mensaje = formatear_mensaje_diario(df_analisis)
+
+            for i in range(0, len(mensaje), 4000):
+                await ctx.bot.send_message(
+                    chat_id=chat_id,
+                    text=mensaje[i:i+4000],
+                    parse_mode=constants.ParseMode.MARKDOWN,
+                )
+            log.info(f"✓ /analizar ({len(sel)} partidos) completado")
+
+        except Exception as e:
+            log.error(f"Error en confirmar análisis: {e}", exc_info=True)
+            await ctx.bot.send_message(chat_id=chat_id,
+                                       text=f"❌ Error al analizar: {e}")
 
 
 async def cmd_resultado(update, ctx):
@@ -306,6 +389,8 @@ def main():
     log.info("Iniciando bot de Telegram...")
     log.info(f"Chat autorizado: {TELEGRAM_CHAT_ID}")
 
+    from telegram.ext import CallbackQueryHandler
+
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("analizar",  cmd_analizar))
@@ -315,6 +400,7 @@ def main():
     app.add_handler(CommandHandler("estado",    cmd_estado))
     app.add_handler(CommandHandler("ayuda",     cmd_ayuda))
     app.add_handler(CommandHandler("start",     cmd_ayuda))
+    app.add_handler(CallbackQueryHandler(callback_seleccion))
 
     log.info("Bot listo. Escuchando comandos...")
     log.info("Comandos: /analizar /resultado /apuestas /dashboard /estado /ayuda")
