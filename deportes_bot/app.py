@@ -20,6 +20,19 @@ load_dotenv()
 
 import streamlit as st
 
+# Inyectar secrets de Streamlit Cloud como variables de entorno
+# (cuando corre en Streamlit Cloud, st.secrets tiene las keys; localmente usa .env)
+_SECRET_KEYS = [
+    "API_FOOTBALL_KEY", "THE_ODDS_API_KEY", "TELEGRAM_TOKEN",
+    "TELEGRAM_CHAT_ID", "OPENAI_API_KEY", "OPENWEATHER_KEY",
+]
+for _k in _SECRET_KEYS:
+    if _k not in os.environ:
+        try:
+            os.environ[_k] = st.secrets[_k]
+        except Exception:
+            pass
+
 # ─── Config de página ────────────────────────────────────
 st.set_page_config(
     page_title="⚽ Sistema Apuestas",
