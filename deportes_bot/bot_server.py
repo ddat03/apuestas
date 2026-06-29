@@ -407,5 +407,33 @@ def main():
     app.run_polling(drop_pending_updates=True)
 
 
+def _iniciar_health_server():
+    """
+    Servidor HTTP mínimo para que Render no duerma el proceso.
+    UptimeRobot pinga /health cada 5 minutos → el proceso sigue vivo.
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+        def log_message(self, *args):
+            pass  # silenciar logs de acceso HTTP
+
+    port = int(os.getenv("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    log.info(f"Health server escuchando en :{port}")
+
+
 if __name__ == "__main__":
+    import asyncio
+    # En Render el bot necesita el health server para no dormir
+    if os.getenv("RENDER"):
+        _iniciar_health_server()
+    asyncio.set_event_loop(asyncio.new_event_loop())
     main()
