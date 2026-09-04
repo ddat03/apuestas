@@ -45,7 +45,8 @@ import requests
 import clv_db
 import combo_builder
 import sharp_ev
-from config import THE_ODDS_API_BASE, THE_ODDS_API_KEY, TELEGRAM_CHAT_ID, TELEGRAM_TOKEN
+from config import (API_FOOTBALL_KEY, THE_ODDS_API_BASE, THE_ODDS_API_KEY,
+                    TELEGRAM_CHAT_ID, TELEGRAM_TOKEN)
 
 # ── Parámetros del test ─────────────────────────────────────────────────
 LIGAS = [
@@ -67,6 +68,7 @@ COMBOS_TAMANOS        = (2, 3)
 COMBOS_MAX_POR_TAMANO = 2
 DESCUENTO_CORRELACION = 0.04
 STAKE_COMBO_U         = 1.0
+USAR_CONFLUENCIA_STATS = True   # ver stats_confluence.py — requiere API_FOOTBALL_KEY
 # Ventana antes del kickoff en la que se (re)captura la línea de Pinnacle.
 # Se guarda en cada ciclo, así que el último snapshot antes del saque es el
 # que queda como "cierre". Amplia (14 h) para no perderla si el bot corre
@@ -76,8 +78,10 @@ SLEEP_HORAS = 12
 
 # Casas grises / no accesibles desde LatAm de forma fiable — se ignoran
 # tanto para colocar el pick como para el conteo de MIN_BOOKS.
+# "onexbet" (1xBet) se sacó de esta lista: Diego apuesta ahí realmente
+# (1xbet.ec), así que excluirla solo escondía la casa que sí puede usar.
 BOOKS_EXCLUIDOS = {
-    "onexbet", "mybookieag", "betonlineag", "betanysports", "gtbets",
+    "mybookieag", "betonlineag", "betanysports", "gtbets",
     "everygame", "sport888", "betfair_sb_uk",
 }
 
@@ -175,6 +179,29 @@ def ciclo() -> None:
             t = datetime.fromisoformat(row["commence_time"].replace("Z", "+00:00"))
             if t < ahora - timedelta(hours=2.5):
                 ligas_con_pend_terminados.add(liga)
+
+    # ── confluencia estadística (forma + H2H, API-Football) ──────────
+    # Segunda mirada independiente del precio: si la forma/H2H CONTRADICE
+    # claramente al favorito del mercado, esa pata se descarta de las
+    # combinadas (nunca al revés — sin datos no descarta nada).
+    if USAR_CONFLUENCIA_STATS and API_FOOTBALL_KEY and patas_pool:
+        import stats_confluence
+        from data_collector import _descargar_ventana_fechas
+        try:
+            fixtures_cache = _descargar_ventana_fechas(dias_atras=5, dias_adelante=2)
+        except Exception as e:
+            print(f"  confluencia: error bajando fixtures API-Football ({e})")
+            fixtures_cache = []
+
+        patas_confirmadas = []
+        for pata in patas_pool:
+            c = stats_confluence.evaluar(pata, fixtures_cache)
+            if c.estado == "contradice":
+                print(f"  ✗ pata descartada por confluencia: {pata.home} vs {pata.away} "
+                      f"({pata.outcome}) — {c.detalle}")
+            else:
+                patas_confirmadas.append(pata)
+        patas_pool = patas_confirmadas
 
     # ── combinadas seguras (mismos datos ya bajados, sin costo extra) ──
     combos_nuevos: list[combo_builder.ComboPropuesto] = []

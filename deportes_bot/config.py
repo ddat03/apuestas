@@ -43,8 +43,11 @@ LIGAS = {
 }
 
 # Solo ligas que tienen partidos AHORA
-# Cambia a [39,140,135,78,61,2] en agosto cuando empiece la temporada europea
-LIGAS_PERMITIDAS = [1]
+# El Mundial 2026 (jun-jul) ya terminó y la temporada europea 25-26 ya
+# empezó (agosto) — este archivo tenía el TODO puesto pero nunca se
+# aplicó, así que main.py llevaba meses buscando fixtures de un torneo
+# que ya no existe.
+LIGAS_PERMITIDAS = [39, 140, 135, 78, 61, 2]
 
 # Temporada por liga (el Mundial 2026 usa season=2026;
 # las ligas europeas 25-26 usan season=2025)
