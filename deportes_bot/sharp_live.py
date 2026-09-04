@@ -203,18 +203,24 @@ def ciclo() -> None:
                 patas_confirmadas.append(pata)
         patas_pool = patas_confirmadas
 
-    # ── combinadas seguras (mismos datos ya bajados, sin costo extra) ──
+    # ── menú de TODAS las patas seguras del ciclo ──────────────────────
+    # No solo las que terminan empaquetadas en un combo automático: Diego
+    # prefiere ver el menú completo y elegir él mismo qué pata de qué
+    # partido combinar, en vez de aceptar un paquete ya armado (misma
+    # lógica por la que no va a tomar la "combinada del día" de 1xbet
+    # tal cual — quiere ver las patas sueltas y armar la suya).
+    patas_nuevas = [p for p in patas_pool
+                    if clv_db.registrar_pick(p, STAKE_COMBO_U, origen="pata_segura")]
+
+    # ── combinadas sugeridas (automáticas, mismos datos, sin costo extra) ──
+    # Se siguen armando y registrando para medir calibración (resumen_combos:
+    # ¿el acierto real se parece a la prob. prometida?) — no son una
+    # recomendación de "apostá esto tal cual".
     combos_nuevos: list[combo_builder.ComboPropuesto] = []
     if len(patas_pool) >= 2:
         for combo in combo_builder.armar_combos(
                 patas_pool, COMBOS_TAMANOS, COMBOS_MAX_POR_TAMANO, DESCUENTO_CORRELACION):
-            pick_ids = []
-            for pata in combo.patas:
-                pid = clv_db.pick_id(pata.event_id, pata.outcome)
-                if pid is None:
-                    clv_db.registrar_pick(pata, STAKE_COMBO_U, origen="combo_seguro")
-                    pid = clv_db.pick_id(pata.event_id, pata.outcome)
-                pick_ids.append(pid)
+            pick_ids = [clv_db.pick_id(p.event_id, p.outcome) for p in combo.patas]
             if clv_db.combo_existe(pick_ids):
                 continue
             clv_db.crear_combo(combo.tipo, pick_ids, combo.cuota_total,
@@ -256,6 +262,23 @@ def ciclo() -> None:
         print("  + " + msg.replace("\n", " | "))
         _tg(msg)
 
+    if patas_nuevas:
+        lineas = [
+            "🗂️ <b>[SHARP] Menú de patas seguras</b>",
+            "Elegí vos qué combinar — no hace falta aceptar un paquete armado:",
+            "",
+        ]
+        for p in sorted(patas_nuevas, key=lambda p: p.fair_prob, reverse=True):
+            lineas.append(
+                f"• <b>{_fmt_outcome(p.outcome, p.home, p.away)}</b> "
+                f"({p.home} vs {p.away}) @ {p.best_odds} ({p.best_book})\n"
+                f"   Pinnacle {p.fair_prob:.0%} · {p.sport} · "
+                f"{p.commence_time[:16].replace('T', ' ')}"
+            )
+        msg = "\n".join(lineas)
+        print("  📋 " + msg.replace("\n", " | "))
+        _tg(msg)
+
     for c in combos_nuevos:
         patas_txt = "\n".join(
             f"  + {_fmt_outcome(p.outcome, p.home, p.away)} ({p.home} vs {p.away}) "
@@ -263,14 +286,17 @@ def ciclo() -> None:
             for p in c.patas
         )
         msg = (
-            f"🛡️ <b>[SHARP] Combinada segura ({c.tipo})</b>\n{patas_txt}\n"
+            f"🛡️ <b>[SHARP] Sugerencia automática ({c.tipo})</b>\n{patas_txt}\n"
             f"Cuota total <b>{c.cuota_total}</b> · Prob. ajustada <b>{c.prob_ajustada:.0%}</b> "
-            f"(cruda {c.prob_producto:.0%}) · EV {c.ev_combo:+.1%}"
+            f"(cruda {c.prob_producto:.0%}) · EV {c.ev_combo:+.1%}\n"
+            f"<i>Es un paquete armado por reglas fijas, solo para medir calibración — "
+            f"no hace falta tomarlo tal cual, mirá el menú de arriba.</i>"
         )
         print("  🛡 " + msg.replace("\n", " | "))
         _tg(msg)
 
-    print(f"  nuevos: {len(nuevos)} | combinadas nuevas: {len(combos_nuevos)} | "
+    print(f"  nuevos: {len(nuevos)} | patas seguras nuevas: {len(patas_nuevas)} | "
+          f"combinadas nuevas: {len(combos_nuevos)} | "
           f"cierres fijados: {cierres} | liquidados: {liquidados} | "
           f"combinadas liquidadas: {combos_liquidados}")
 
