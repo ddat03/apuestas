@@ -1,0 +1,361 @@
+# ============================================================
+#  sharp_live.py — Test forward del sistema +EV con ancla Pinnacle
+#
+#  Creado por Diego Aleman.
+#
+#  Cada ejecución (1 llamada de cuotas por liga, nada más):
+#    1. Baja cuotas h2h de las ligas configuradas (The Odds API).
+#    2. Con esa MISMA respuesta:
+#       a. busca valor (mejor casa reputada vs Pinnacle no-vig)
+#          y registra los picks NUEVOS en data/clv.db;
+#       b. busca patas "seguras" (prob. justa Pinnacle ≥ 70%) y
+#          arma combinadas de 2-3 patas de ligas distintas
+#          (combo_builder.py) — cero llamadas extra a la API;
+#       c. a los picks pendientes cuyo partido está por empezar,
+#          les guarda la línea de CIERRE de Pinnacle → CLV.
+#    3. Si hay picks (o patas de combinadas) cuyo partido ya
+#       terminó, pide el marcador (endpoint scores), los liquida
+#       → ROI de papel, y liquida las combinadas cuyas patas ya
+#       estén todas resueltas.
+#    4. Resumen por consola + Telegram.
+#
+#  NO coloca ninguna apuesta real. Mide el CLV (picks individuales)
+#  y el acierto real vs. la probabilidad prometida (combinadas)
+#  durante 3-4 semanas: si son claramente positivos, el método
+#  tiene edge y se puede pensar en escalar. Si no, es ruido.
+#
+#  Consumo API: ~6 llamadas/ciclo (una por liga) + scores solo
+#  cuando hay partidos terminados sin liquidar. Con --loop cada
+#  12 h son ~15-25/día → cabe en el plan free (500/mes).
+#
+#  Uso:
+#    python sharp_live.py            → un ciclo
+#    python sharp_live.py --loop     → repite cada SLEEP_HORAS
+#    python sharp_live.py --resumen  → estado de clv.db y sale
+#    python sharp_live.py --picks    → lista picks individuales
+#    python sharp_live.py --combos   → lista combinadas seguras
+# ============================================================
+
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+
+import requests
+
+import clv_db
+import combo_builder
+import sharp_ev
+from config import THE_ODDS_API_BASE, THE_ODDS_API_KEY, TELEGRAM_CHAT_ID, TELEGRAM_TOKEN
+
+# ── Parámetros del test ─────────────────────────────────────────────────
+LIGAS = [
+    "soccer_epl", "soccer_spain_la_liga", "soccer_italy_serie_a",
+    "soccer_germany_bundesliga", "soccer_france_ligue_one",
+    "soccer_uefa_champs_league",
+]
+REGIONS = "eu,uk"
+EV_MIN = 0.025         # 2.5% de valor mínimo contra Pinnacle no-vig
+EV_MAX = 0.10          # por encima de esto casi siempre es cuota stale / mal emparejada
+MIN_BOOKS = 10         # mínimo de casas reputadas en el evento
+STAKE_U = 1.0          # unidades por pick (plano — Kelly viene después si hay edge)
+
+# ── Parámetros de combinadas seguras (combo_builder.py) ───────────────
+# Usan los MISMOS datos ya bajados arriba — cero llamadas extra a la API.
+PATA_PROB_MIN         = 0.70   # prob. justa mínima (Pinnacle) para que una pata cuente como "segura"
+PATA_MAX_DESCUENTO    = 0.08   # cuánto margen de más se tolera pagar por esa seguridad
+COMBOS_TAMANOS        = (2, 3)
+COMBOS_MAX_POR_TAMANO = 2
+DESCUENTO_CORRELACION = 0.04
+STAKE_COMBO_U         = 1.0
+# Ventana antes del kickoff en la que se (re)captura la línea de Pinnacle.
+# Se guarda en cada ciclo, así que el último snapshot antes del saque es el
+# que queda como "cierre". Amplia (14 h) para no perderla si el bot corre
+# solo 2 veces al día.
+CAPTURAR_CIERRE_HORAS = 14
+SLEEP_HORAS = 12
+
+# Casas grises / no accesibles desde LatAm de forma fiable — se ignoran
+# tanto para colocar el pick como para el conteo de MIN_BOOKS.
+BOOKS_EXCLUIDOS = {
+    "onexbet", "mybookieag", "betonlineag", "betanysports", "gtbets",
+    "everygame", "sport888", "betfair_sb_uk",
+}
+
+
+def _tg(texto: str) -> None:
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": texto, "parse_mode": "HTML"},
+            timeout=10,
+        )
+    except requests.RequestException:
+        pass
+
+
+def _get(path: str, **params) -> tuple[list, str]:
+    params["apiKey"] = THE_ODDS_API_KEY
+    r = requests.get(f"{THE_ODDS_API_BASE}/{path}", params=params, timeout=25)
+    r.raise_for_status()
+    return r.json(), r.headers.get("x-requests-remaining", "?")
+
+
+def _limpiar_books(event: dict) -> dict:
+    """Quita del evento las casas excluidas (grises / no accesibles)."""
+    event = dict(event)
+    event["bookmakers"] = [
+        b for b in event.get("bookmakers", []) if b["key"] not in BOOKS_EXCLUIDOS
+    ]
+    return event
+
+
+def _fmt_outcome(p_outcome: str, home: str, away: str) -> str:
+    return {"local": home, "empate": "Empate", "visitante": away}[p_outcome]
+
+
+# ── ciclo ─────────────────────────────────────────────────────────────
+
+def ciclo() -> None:
+    print(f"\n[{datetime.now(timezone.utc):%Y-%m-%d %H:%M}] ── ciclo sharp_live ──")
+    ahora = datetime.now(timezone.utc)
+    pend = {(r["event_id"], r["outcome"]): r for r in clv_db.pendientes()}
+    ligas_con_pend_terminados: set[str] = set()
+
+    nuevos, cierres = [], 0
+    patas_pool: list[combo_builder.PataSegura] = []
+
+    for liga in LIGAS:
+        try:
+            eventos, rem = _get(f"sports/{liga}/odds", regions=REGIONS,
+                                markets="h2h", oddsFormat="decimal")
+        except requests.RequestException as e:
+            print(f"  {liga}: error cuotas ({e})")
+            continue
+        print(f"  {liga}: {len(eventos)} eventos | quota restante {rem}")
+
+        for ev in eventos:
+            ev["sport_key"] = liga
+            ev = _limpiar_books(ev)
+            ini = datetime.fromisoformat(ev["commence_time"].replace("Z", "+00:00"))
+
+            # a. picks nuevos (solo partidos que no empezaron)
+            if ini > ahora:
+                for pick in sharp_ev.analizar_evento(ev, EV_MIN, EV_MAX, MIN_BOOKS):
+                    if clv_db.registrar_pick(pick, STAKE_U):
+                        nuevos.append(pick)
+
+                pata = combo_builder.pata_segura_evento(
+                    ev, PATA_PROB_MIN, MIN_BOOKS, PATA_MAX_DESCUENTO)
+                if pata:
+                    patas_pool.append(pata)
+
+            # b. línea de cierre para picks pendientes de este evento,
+            #    en la ventana previa al kickoff o ya empezados
+            if ini <= ahora + timedelta(hours=CAPTURAR_CIERRE_HORAS):
+                precios = sharp_ev._precios_por_casa(ev)
+                if sharp_ev.ANCLA in precios:
+                    fair = sharp_ev._novig(precios[sharp_ev.ANCLA])
+                    for (eid, outcome), row in pend.items():
+                        if eid != ev.get("id"):
+                            continue
+                        oc = precios[sharp_ev.ANCLA].get(outcome)
+                        if not oc:
+                            continue
+                        clv = sharp_ev.ev_vs_cierre(row["odds_taken"], fair[outcome])
+                        clv_db.actualizar_cierre(eid, outcome, oc, fair[outcome],
+                                                 clv, row["odds_taken"])
+                        cierres += 1
+
+        # ¿hay picks pendientes de esta liga cuyo partido ya terminó?
+        for (eid, oc), row in pend.items():
+            if row["sport"] != liga:
+                continue
+            t = datetime.fromisoformat(row["commence_time"].replace("Z", "+00:00"))
+            if t < ahora - timedelta(hours=2.5):
+                ligas_con_pend_terminados.add(liga)
+
+    # ── combinadas seguras (mismos datos ya bajados, sin costo extra) ──
+    combos_nuevos: list[combo_builder.ComboPropuesto] = []
+    if len(patas_pool) >= 2:
+        for combo in combo_builder.armar_combos(
+                patas_pool, COMBOS_TAMANOS, COMBOS_MAX_POR_TAMANO, DESCUENTO_CORRELACION):
+            pick_ids = []
+            for pata in combo.patas:
+                pid = clv_db.pick_id(pata.event_id, pata.outcome)
+                if pid is None:
+                    clv_db.registrar_pick(pata, STAKE_COMBO_U, origen="combo_seguro")
+                    pid = clv_db.pick_id(pata.event_id, pata.outcome)
+                pick_ids.append(pid)
+            if clv_db.combo_existe(pick_ids):
+                continue
+            clv_db.crear_combo(combo.tipo, pick_ids, combo.cuota_total,
+                               combo.prob_producto, combo.prob_ajustada, STAKE_COMBO_U)
+            combos_nuevos.append(combo)
+
+    # ── liquidar partidos terminados ──
+    liquidados = 0
+    for liga in ligas_con_pend_terminados:
+        try:
+            scores, _ = _get(f"sports/{liga}/scores", daysFrom=2)
+        except requests.RequestException:
+            continue
+        por_id = {s["id"]: s for s in scores}
+        for (eid, outcome), row in pend.items():
+            if row["sport"] != liga:
+                continue
+            s = por_id.get(eid)
+            if not s or not s.get("completed") or not s.get("scores"):
+                continue
+            marcador = {x["name"]: int(x["score"]) for x in s["scores"]}
+            gh, ga = marcador.get(s["home_team"]), marcador.get(s["away_team"])
+            if gh is None or ga is None:
+                continue
+            gano = "local" if gh > ga else "visitante" if ga > gh else "empate"
+            clv_db.liquidar(eid, outcome, "WIN" if outcome == gano else "LOSS")
+            liquidados += 1
+
+    combos_liquidados = clv_db.liquidar_combos()
+
+    # ── avisos + resumen ──
+    for p in nuevos:
+        msg = (
+            f"🎯 <b>[SHARP] Pick</b>\n{p.home} vs {p.away}\n"
+            f"<b>{_fmt_outcome(p.outcome, p.home, p.away)}</b> @ {p.best_odds} ({p.best_book})\n"
+            f"Pinnacle no-vig {p.fair_prob:.1%} · EV +{p.ev:.1%} · {p.n_books} casas\n"
+            f"{p.commence_time[:16].replace('T', ' ')}"
+        )
+        print("  + " + msg.replace("\n", " | "))
+        _tg(msg)
+
+    for c in combos_nuevos:
+        patas_txt = "\n".join(
+            f"  + {_fmt_outcome(p.outcome, p.home, p.away)} ({p.home} vs {p.away}) "
+            f"@ {p.best_odds} · Pinnacle {p.fair_prob:.0%}"
+            for p in c.patas
+        )
+        msg = (
+            f"🛡️ <b>[SHARP] Combinada segura ({c.tipo})</b>\n{patas_txt}\n"
+            f"Cuota total <b>{c.cuota_total}</b> · Prob. ajustada <b>{c.prob_ajustada:.0%}</b> "
+            f"(cruda {c.prob_producto:.0%}) · EV {c.ev_combo:+.1%}"
+        )
+        print("  🛡 " + msg.replace("\n", " | "))
+        _tg(msg)
+
+    print(f"  nuevos: {len(nuevos)} | combinadas nuevas: {len(combos_nuevos)} | "
+          f"cierres fijados: {cierres} | liquidados: {liquidados} | "
+          f"combinadas liquidadas: {combos_liquidados}")
+
+    r = clv_db.resumen()
+    linea = (f"picks {r['picks_total']} · pend {r['pendientes']} · "
+             f"con cierre {r.get('con_linea_cierre', 0)} · liquidados {r.get('liquidados', 0)}")
+    if "clv_ev_medio" in r:
+        linea += (f"\nCLV EV medio {r['clv_ev_medio']:+.2%} · "
+                  f"batió cierre {r['pct_batio_cierre']:.0%}")
+    if "roi" in r:
+        linea += f"\nROI papel {r['roi']:+.1%} ({r['pnl_u']:+.1f}u · WR {r['win_rate']:.0%})"
+
+    rc = clv_db.resumen_combos()
+    if rc["combos_total"]:
+        linea += (f"\nCombinadas: {rc['combos_total']} total · {rc['pendientes']} pend · "
+                  f"{rc['liquidadas']} liquidadas")
+        if "win_rate_real" in rc:
+            linea += (f"\n  WR real {rc['win_rate_real']:.0%} vs prometido "
+                      f"{rc['prob_prometida_media']:.0%} · ROI {rc['roi']:+.1%}")
+
+    print("  " + linea.replace("\n", "\n  "))
+    if nuevos or combos_nuevos or cierres or liquidados or combos_liquidados:
+        _tg(f"📊 <b>[SHARP] Estado</b>\n{linea}")
+
+
+def _mostrar_picks() -> None:
+    import sqlite3
+    c = sqlite3.connect(clv_db.DB)
+    c.row_factory = sqlite3.Row
+    filas = c.execute(
+        "SELECT * FROM picks ORDER BY (status='SETTLED'), commence_time").fetchall()
+    if not filas:
+        print("Sin picks todavía. Corré un ciclo: python sharp_live.py")
+        return
+    for r in filas:
+        sel = (r["home"] if r["outcome"] == "local"
+               else r["away"] if r["outcome"] == "visitante" else "Empate")
+        est = r["result"] or ("cierre✓" if r["clv_ev"] is not None else "pendiente")
+        clv = f" | CLV {r['clv_ev']:+.1%}" if r["clv_ev"] is not None else ""
+        pnl = f" | {r['pnl_u']:+.2f}u" if r["pnl_u"] is not None else ""
+        print(f"{r['commence_time'][:16].replace('T', ' ')}  "
+              f"{r['home'][:16]:16} v {r['away'][:16]:16}  "
+              f"{sel[:16]:16} @ {r['odds_taken']:<5} {r['book_taken'][:12]:12} "
+              f"EV+{r['ev_pick']*100:.1f}%  [{est}]{clv}{pnl}")
+
+
+def _mostrar_combos() -> None:
+    import sqlite3
+    c = sqlite3.connect(clv_db.DB)
+    c.row_factory = sqlite3.Row
+    combos = c.execute(
+        "SELECT * FROM combos ORDER BY (status='SETTLED'), ts_creado").fetchall()
+    if not combos:
+        print("Sin combinadas todavía. Corré un ciclo: python sharp_live.py")
+        return
+    for combo in combos:
+        legs = c.execute(
+            """SELECT p.home, p.away, p.outcome, p.odds_taken, p.result FROM combo_legs cl
+               JOIN picks p ON p.id = cl.pick_id WHERE cl.combo_id=?""",
+            (combo["id"],)).fetchall()
+        est = combo["result"] or "pendiente"
+        pnl = f" | {combo['pnl_u']:+.2f}u" if combo["pnl_u"] is not None else ""
+        print(f"#{combo['id']:<3} {combo['tipo']:8} cuota={combo['cuota_total']:<6} "
+              f"prob_ajustada={combo['prob_ajustada']:.0%}  [{est}]{pnl}")
+        for leg in legs:
+            sel = (leg["home"] if leg["outcome"] == "local"
+                   else leg["away"] if leg["outcome"] == "visitante" else "Empate")
+            r = leg["result"] or "?"
+            print(f"      - {leg['home'][:16]:16} v {leg['away'][:16]:16}  "
+                  f"{sel[:16]:16} @ {leg['odds_taken']:<5} [{r}]")
+
+
+def main() -> None:
+    if "--resumen" in sys.argv:
+        for k, v in clv_db.resumen().items():
+            print(f"  {k}: {v}")
+        print("  --- combinadas ---")
+        for k, v in clv_db.resumen_combos().items():
+            print(f"  {k}: {v}")
+        return
+
+    if "--picks" in sys.argv:
+        _mostrar_picks()
+        return
+
+    if "--combos" in sys.argv:
+        _mostrar_combos()
+        return
+
+    if not THE_ODDS_API_KEY:
+        print("Falta THE_ODDS_API_KEY en .env")
+        sys.exit(1)
+
+    print("═══ SHARP LIVE — test forward +EV con ancla Pinnacle ═══")
+    print("    Creado por Diego Aleman · 100% papel, ninguna apuesta real")
+    _tg("🧪 <b>[SHARP] Test iniciado</b>\nMidiendo CLV vs Pinnacle en papel. "
+        "Sin dinero real. Objetivo: 3-4 semanas de datos.")
+
+    while True:
+        try:
+            ciclo()
+        except KeyboardInterrupt:
+            print("\nDetenido por el usuario.")
+            break
+        except Exception as e:  # noqa: BLE001
+            print(f"  error en el ciclo: {e}")
+            _tg(f"⚠️ <b>[SHARP] error</b>\n{str(e)[:300]}")
+        if "--loop" not in sys.argv:
+            break
+        print(f"    durmiendo {SLEEP_HORAS}h…")
+        time.sleep(SLEEP_HORAS * 3600)
+
+
+if __name__ == "__main__":
+    main()
