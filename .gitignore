@@ -11,10 +11,17 @@ venv/
 *.egg-info/
 
 # Datos generados (no son código)
-deportes_bot/data/
+# (data/ con /* en vez de / para poder "des-ignorar" clv.db abajo — git no
+#  desciende a mirar excepciones dentro de un directorio excluido entero)
+deportes_bot/data/*
 deportes_bot/logs/
 deportes_bot/models/
 deportes_bot/reports/
+
+# Excepción: clv.db SÍ se versiona (sin secretos, solo picks/cuotas/resultados).
+# El workflow sharp_live.yml corre en GitHub Actions, que arranca de cero en
+# cada corrida — sin esto se perdería el historial de picks entre ejecuciones.
+!deportes_bot/data/clv.db
 
 # Sistema
 .DS_Store

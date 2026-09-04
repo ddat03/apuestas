@@ -1,0 +1,55 @@
+name: Sharp Live — combinadas seguras + CLV
+
+# Corre UN ciclo de sharp_live.py (no --loop: en un runner efímero no tiene
+# sentido dormir horas dentro del job) cada ~12h. Reutiliza los mismos
+# secrets que ya usa analisis_diario.yml. data/clv.db se versiona en el
+# repo (ver .gitignore) porque el runner arranca de cero en cada corrida —
+# sin comitear el progreso se perdería el historial de picks pendientes.
+
+on:
+  schedule:
+    - cron: '0 8,20 * * *'   # 08:00 y 20:00 UTC — desfasado del análisis diario (14:00 UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sharp_live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: sharp-live-clv-db
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Instalar dependencias
+        run: |
+          cd deportes_bot
+          pip install -r requirements.txt
+
+      - name: Correr un ciclo de sharp_live
+        env:
+          THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          cd deportes_bot
+          python sharp_live.py
+
+      - name: Guardar progreso de clv.db
+        run: |
+          git config user.name "sharp-live-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -f deportes_bot/data/clv.db
+          git diff --cached --quiet || git commit -m "chore: actualizar clv.db (ciclo sharp_live automático)"
+          git push
