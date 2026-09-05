@@ -168,8 +168,15 @@ st.divider()
 # ────────────────────────────────────────────────────────────
 
 col_boton, _ = st.columns([1, 5])
-if col_boton.button("🔄 Recargar partidos"):
+if col_boton.button("🔄 Recargar partidos", help="Limpia TODO el caché (partidos, forma, H2H, ausencias, "
+                                                 "cuota de referencia) — usar si algo se ve desactualizado."):
     _partidos_cache.clear()
+    _stats_cache.clear()
+    _h2h_cache.clear()
+    _ausencias_cache.clear()
+    _evento_id_cache.clear()
+    _odds_referencia_cache.clear()
+    st.rerun()
 
 partidos = _partidos_cache()
 
