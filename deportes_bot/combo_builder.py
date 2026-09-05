@@ -110,11 +110,17 @@ def _producto(vals) -> float:
     return r
 
 
-def armar_combos(patas: list[PataSegura], tamanos: tuple[int, ...] = (2, 3),
+def armar_combos(patas: list, tamanos: tuple[int, ...] = (2, 3),
                  max_por_tamano: int = 2,
                  descuento_correlacion: float = 0.04,
                  exigir_ligas_distintas: bool = True) -> list[ComboPropuesto]:
     """
+    `patas` puede mezclar PataSegura (1X2) y PataTotals (goles, ver
+    totals_ev.py) — ambas exponen los mismos campos clave (sport,
+    event_id, fair_prob, best_odds), así que se combinan sin problema.
+    exigir_ligas_distintas ya evita mezclar dos patas del MISMO partido
+    (comparten sport) aunque sean de mercados distintos.
+
     Arma varias combinadas distintas (no solo una), priorizando las
     patas de mayor probabilidad y — si exigir_ligas_distintas — sin
     repetir liga dentro de la misma combinada, para minimizar

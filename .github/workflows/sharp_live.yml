@@ -1,14 +1,23 @@
 name: Sharp Live — combinadas seguras + CLV
 
 # Corre UN ciclo de sharp_live.py (no --loop: en un runner efímero no tiene
-# sentido dormir horas dentro del job) cada ~12h. Reutiliza los mismos
+# sentido dormir horas dentro del job) 1 vez/día. Reutiliza los mismos
 # secrets que ya usa analisis_diario.yml. data/clv.db se versiona en el
 # repo (ver .gitignore) porque el runner arranca de cero en cada corrida —
 # sin comitear el progreso se perdería el historial de picks pendientes.
+#
+# Por qué 1/día y no 2: desde que se sumó el mercado "totals" (goles), el
+# costo real de The Odds API es créditos = regiones × mercados por request
+# = 2×2 = 4 créditos × 6 ligas = 24/corrida. A 2 corridas/día son ~1440/mes
+# contra un plan free de 500/mes. A 1/día son ~720/mes — sigue siendo más
+# de 500, pero sin costo de dinero real (plan free): si se agota antes de
+# fin de mes, sharp_live.py simplemente deja de traer cuotas nuevas hasta
+# que se resetee, no rompe nada. Hay una alerta de Telegram cuando queda
+# poca cuota (ver QUOTA_ALERTA_BAJO en sharp_live.py).
 
 on:
   schedule:
-    - cron: '0 8,20 * * *'   # 08:00 y 20:00 UTC — desfasado del análisis diario (14:00 UTC)
+    - cron: '0 12 * * *'   # 12:00 UTC (~07:00 Ecuador) — antes de que arranquen los partidos del día
   workflow_dispatch:
 
 permissions:
@@ -42,6 +51,7 @@ jobs:
           THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
           TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
         run: |
           cd deportes_bot
           python sharp_live.py

@@ -4,29 +4,34 @@
 #  Creado por Diego Aleman.
 #
 #  Cada ejecución (1 llamada de cuotas por liga, nada más):
-#    1. Baja cuotas h2h de las ligas configuradas (The Odds API).
+#    1. Baja cuotas h2h + totals (goles) de las ligas configuradas
+#       (The Odds API).
 #    2. Con esa MISMA respuesta:
-#       a. busca valor (mejor casa reputada vs Pinnacle no-vig)
+#       a. busca valor 1X2 (mejor casa reputada vs Pinnacle no-vig)
 #          y registra los picks NUEVOS en data/clv.db;
-#       b. busca patas "seguras" (prob. justa Pinnacle ≥ 70%) y
-#          arma combinadas de 2-3 patas de ligas distintas
-#          (combo_builder.py) — cero llamadas extra a la API;
-#       c. a los picks pendientes cuyo partido está por empezar,
+#       b. busca patas "seguras" (prob. justa Pinnacle ≥ 70%) en
+#          1X2 (combo_builder.py) Y en goles Over/Under
+#          (totals_ev.py) — cero llamadas extra a la API — y arma
+#          combinadas de 2-3 patas de ligas distintas;
+#       c. si hay API_FOOTBALL_KEY, evalúa cada pata segura contra
+#          forma reciente + H2H (stats_confluence.py) y descarta la
+#          que la estadística contradiga claramente;
+#       d. a los picks pendientes cuyo partido está por empezar,
 #          les guarda la línea de CIERRE de Pinnacle → CLV.
 #    3. Si hay picks (o patas de combinadas) cuyo partido ya
 #       terminó, pide el marcador (endpoint scores), los liquida
 #       → ROI de papel, y liquida las combinadas cuyas patas ya
 #       estén todas resueltas.
-#    4. Resumen por consola + Telegram.
+#    4. Resumen por consola + Telegram (+ aviso si queda poca cuota).
 #
 #  NO coloca ninguna apuesta real. Mide el CLV (picks individuales)
 #  y el acierto real vs. la probabilidad prometida (combinadas)
 #  durante 3-4 semanas: si son claramente positivos, el método
 #  tiene edge y se puede pensar en escalar. Si no, es ruido.
 #
-#  Consumo API: ~6 llamadas/ciclo (una por liga) + scores solo
-#  cuando hay partidos terminados sin liquidar. Con --loop cada
-#  12 h son ~15-25/día → cabe en el plan free (500/mes).
+#  Consumo API: ver el comentario junto a MARKETS/QUOTA_ALERTA_BAJO
+#  más abajo — con el mercado de goles sumado, el costo real es el
+#  doble de lo que un comentario viejo acá asumía.
 #
 #  Uso:
 #    python sharp_live.py            → un ciclo
@@ -45,6 +50,7 @@ import requests
 import clv_db
 import combo_builder
 import sharp_ev
+import totals_ev
 from config import (API_FOOTBALL_KEY, THE_ODDS_API_BASE, THE_ODDS_API_KEY,
                     TELEGRAM_CHAT_ID, TELEGRAM_TOKEN)
 
@@ -55,6 +61,14 @@ LIGAS = [
     "soccer_uefa_champs_league",
 ]
 REGIONS = "eu,uk"
+MARKETS = "h2h,totals"
+# OJO con la cuota: The Odds API cobra créditos = nº regiones × nº mercados
+# POR REQUEST (no 1 por request como asumía un comentario viejo acá). Con
+# 2 regiones × 2 mercados = 4 créditos × 6 ligas × 1 corrida/día × 30 días
+# ≈ 720/mes — ya se come casi todo el plan free (500/mes) con margen para
+# los pedidos de /scores. Por eso GitHub Actions corre 1 vez/día, no 2
+# (ver .github/workflows/sharp_live.yml) — con 2/día esto sería ~1440/mes.
+QUOTA_ALERTA_BAJO = 60   # si "requests-remaining" baja de esto, avisar por Telegram
 EV_MIN = 0.025         # 2.5% de valor mínimo contra Pinnacle no-vig
 EV_MAX = 0.10          # por encima de esto casi siempre es cuota stale / mal emparejada
 MIN_BOOKS = 10         # mínimo de casas reputadas en el evento
@@ -116,7 +130,14 @@ def _limpiar_books(event: dict) -> dict:
 
 
 def _fmt_outcome(p_outcome: str, home: str, away: str) -> str:
-    return {"local": home, "empate": "Empate", "visitante": away}[p_outcome]
+    mapa = {"local": home, "empate": "Empate", "visitante": away}
+    if p_outcome in mapa:
+        return mapa[p_outcome]
+    if p_outcome.startswith("over_"):
+        return f"Más de {p_outcome.split('_', 1)[1]} goles"
+    if p_outcome.startswith("under_"):
+        return f"Menos de {p_outcome.split('_', 1)[1]} goles"
+    return p_outcome
 
 
 # ── ciclo ─────────────────────────────────────────────────────────────
@@ -128,16 +149,22 @@ def ciclo() -> None:
     ligas_con_pend_terminados: set[str] = set()
 
     nuevos, cierres = [], 0
-    patas_pool: list[combo_builder.PataSegura] = []
+    patas_pool: list = []   # PataSegura (h2h) y/o PataTotals (goles) — mismos campos clave
+    quota_restante_min: int | None = None
 
     for liga in LIGAS:
         try:
             eventos, rem = _get(f"sports/{liga}/odds", regions=REGIONS,
-                                markets="h2h", oddsFormat="decimal")
+                                markets=MARKETS, oddsFormat="decimal")
         except requests.RequestException as e:
             print(f"  {liga}: error cuotas ({e})")
             continue
         print(f"  {liga}: {len(eventos)} eventos | quota restante {rem}")
+        try:
+            rem_i = int(rem)
+            quota_restante_min = rem_i if quota_restante_min is None else min(quota_restante_min, rem_i)
+        except ValueError:
+            pass
 
         for ev in eventos:
             ev["sport_key"] = liga
@@ -154,6 +181,11 @@ def ciclo() -> None:
                     ev, PATA_PROB_MIN, MIN_BOOKS, PATA_MAX_DESCUENTO)
                 if pata:
                     patas_pool.append(pata)
+
+                pata_gol = totals_ev.pata_segura_evento(
+                    ev, PATA_PROB_MIN, MIN_BOOKS, PATA_MAX_DESCUENTO)
+                if pata_gol:
+                    patas_pool.append(pata_gol)
 
             # b. línea de cierre para picks pendientes de este evento,
             #    en la ventana previa al kickoff o ya empezados
@@ -245,8 +277,16 @@ def ciclo() -> None:
             gh, ga = marcador.get(s["home_team"]), marcador.get(s["away_team"])
             if gh is None or ga is None:
                 continue
-            gano = "local" if gh > ga else "visitante" if ga > gh else "empate"
-            clv_db.liquidar(eid, outcome, "WIN" if outcome == gano else "LOSS")
+
+            if outcome in ("local", "empate", "visitante"):
+                gano = "local" if gh > ga else "visitante" if ga > gh else "empate"
+                resultado = "WIN" if outcome == gano else "LOSS"
+            elif outcome.startswith("over_") or outcome.startswith("under_"):
+                resultado = totals_ev.liquidar_outcome(outcome, gh, ga)
+            else:
+                continue
+
+            clv_db.liquidar(eid, outcome, resultado)
             liquidados += 1
 
     combos_liquidados = clv_db.liquidar_combos()
@@ -320,6 +360,11 @@ def ciclo() -> None:
     print("  " + linea.replace("\n", "\n  "))
     if nuevos or combos_nuevos or cierres or liquidados or combos_liquidados:
         _tg(f"📊 <b>[SHARP] Estado</b>\n{linea}")
+
+    if quota_restante_min is not None and quota_restante_min < QUOTA_ALERTA_BAJO:
+        _tg(f"⚠️ <b>[SHARP] Cuota de The Odds API baja</b>\n"
+            f"Quedan {quota_restante_min} requests este mes. Se resetea a fin de mes — "
+            f"si se agota, sharp_live simplemente deja de traer cuotas nuevas hasta entonces.")
 
 
 def _mostrar_picks() -> None:
