@@ -4,6 +4,8 @@ pandas==2.2.0
 numpy==1.26.4
 pyarrow
 python-dotenv==1.0.0
+curl_cffi>=0.7.0   # necesario para Sofascore (sofascore_client.py) — Cloudflare
+                   # bloquea el fingerprint TLS de requests plano, esto lo esquiva
 
 # ─── Machine Learning ────────────────────
 scikit-learn==1.4.0

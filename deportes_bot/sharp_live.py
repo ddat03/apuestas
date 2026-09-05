@@ -13,9 +13,10 @@
 #          1X2 (combo_builder.py) Y en goles Over/Under
 #          (totals_ev.py) — cero llamadas extra a la API — y arma
 #          combinadas de 2-3 patas de ligas distintas;
-#       c. si hay API_FOOTBALL_KEY, evalúa cada pata segura contra
-#          forma reciente + H2H (stats_confluence.py) y descarta la
-#          que la estadística contradiga claramente;
+#       c. evalúa cada pata segura contra forma reciente + H2H de
+#          Sofascore (stats_confluence.py / sofascore_client.py, sin
+#          key ni cuenta) y descarta la que la estadística contradiga
+#          claramente;
 #       d. a los picks pendientes cuyo partido está por empezar,
 #          les guarda la línea de CIERRE de Pinnacle → CLV.
 #    3. Si hay picks (o patas de combinadas) cuyo partido ya
@@ -51,8 +52,7 @@ import clv_db
 import combo_builder
 import sharp_ev
 import totals_ev
-from config import (API_FOOTBALL_KEY, THE_ODDS_API_BASE, THE_ODDS_API_KEY,
-                    TELEGRAM_CHAT_ID, TELEGRAM_TOKEN)
+from config import THE_ODDS_API_BASE, THE_ODDS_API_KEY, TELEGRAM_CHAT_ID, TELEGRAM_TOKEN
 
 # ── Parámetros del test ─────────────────────────────────────────────────
 LIGAS = [
@@ -212,22 +212,17 @@ def ciclo() -> None:
             if t < ahora - timedelta(hours=2.5):
                 ligas_con_pend_terminados.add(liga)
 
-    # ── confluencia estadística (forma + H2H, API-Football) ──────────
+    # ── confluencia estadística (forma + H2H, Sofascore) ──────────────
     # Segunda mirada independiente del precio: si la forma/H2H CONTRADICE
     # claramente al favorito del mercado, esa pata se descarta de las
-    # combinadas (nunca al revés — sin datos no descarta nada).
-    if USAR_CONFLUENCIA_STATS and API_FOOTBALL_KEY and patas_pool:
+    # combinadas (nunca al revés — sin datos no descarta nada). Sin key
+    # ni cuenta que puedan bloquearse — cada pata hace sus propias
+    # consultas a Sofascore (no depende de ningún cache pre-descargado).
+    if USAR_CONFLUENCIA_STATS and patas_pool:
         import stats_confluence
-        from data_collector import _descargar_ventana_fechas
-        try:
-            fixtures_cache = _descargar_ventana_fechas(dias_atras=5, dias_adelante=2)
-        except Exception as e:
-            print(f"  confluencia: error bajando fixtures API-Football ({e})")
-            fixtures_cache = []
-
         patas_confirmadas = []
         for pata in patas_pool:
-            c = stats_confluence.evaluar(pata, fixtures_cache)
+            c = stats_confluence.evaluar(pata)
             if c.estado == "contradice":
                 print(f"  ✗ pata descartada por confluencia: {pata.home} vs {pata.away} "
                       f"({pata.outcome}) — {c.detalle}")
