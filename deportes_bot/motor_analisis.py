@@ -182,6 +182,32 @@ def _analizar_btts(seleccion: str, cuota: float, hist_home: list[dict], hist_awa
                      + ("a favor de la selección" if cumple else "en contra de la selección"))
 
 
+def _analizar_marca(seleccion: str, cuota: float, hist_home: list[dict], hist_away: list[dict],
+                    alcance: str) -> Veredicto | None:
+    """"¿Marcará?" / "Anotará" — a diferencia de BTTS, es de UN solo
+    equipo (necesita alcance="home"/"away"; con "total" no se puede
+    responder, así que no se analiza)."""
+    texto = seleccion.lower()
+    quiere_si = texto in ("sí", "si", "yes")
+    quiere_no = texto == "no"
+    if not (quiere_si or quiere_no) or alcance not in ("home", "away"):
+        return None
+
+    historial = hist_home if alcance == "home" else hist_away
+    marcaron = sum(1 for h in historial if h.get("goles_favor") is not None and h["goles_favor"] > 0)
+    n = len(historial)
+    if n < MIN_PARTIDOS_CONFIABLE:
+        return Veredicto(True, f"Muestra chica ({n} partidos con datos) — no confiar solo en esto",
+                         f"{marcaron}/{n} partidos recientes marcó al menos un gol")
+
+    freq = marcaron / n
+    prob_implicita = 1.0 / cuota
+    cumple = freq >= prob_implicita if quiere_si else (1 - freq) >= prob_implicita
+    return Veredicto(True,
+                     f"Marcó en {marcaron}/{n} partidos recientes ({freq:.0%}) — cuota implica "
+                     f"{prob_implicita:.0%} — " + ("a favor de la selección" if cumple else "en contra de la selección"))
+
+
 def _normalizar_nombre(nombre: str) -> str:
     n = unicodedata.normalize("NFKD", nombre or "").encode("ascii", "ignore").decode().lower()
     return re.sub(r"\s+", " ", n).strip()
@@ -198,26 +224,52 @@ def _mismo_equipo(a: str, b: str) -> bool:
 
 
 def _analizar_ganador(seleccion: str, cuota: float, home: str, away: str,
-                      forma_home, forma_away, ausencias: dict | None, etiqueta_mercado: str) -> Veredicto:
+                      forma_home, forma_away, ausencias: dict | None, etiqueta_mercado: str,
+                      odds_referencia: dict | None = None) -> Veredicto:
     """Sirve tanto para 1X2 como para "Pronóstico sin empate" (Draw No
-    Bet) — en los dos la selección es un nombre de equipo, y la señal
-    que podemos dar es la misma (cualitativa: forma + ausencias, no
-    frecuencia — eso lo hace mejor sharp_ev.py/combo_builder.py)."""
+    Bet). Con odds_referencia (cuota 1X2 de Sofascore/bet365, ver
+    sofascore_client.odds_1x2_evento) da un veredicto real tipo EV —
+    sin eso, o para DNB (donde la referencia de 1X2 no aplica igual),
+    queda en señal cualitativa: forma + ausencias, sin concluir nada
+    por sí sola (eso lo hace mejor sharp_ev.py/combo_builder.py)."""
     es_local = _mismo_equipo(seleccion, home)
     es_visita = not es_local and _mismo_equipo(seleccion, away)
+
+    if not es_local and not es_visita:
+        # No debería pasar casi nunca (home/away salen del mismo partido
+        # que la cuota) — pero si pasa, mejor decirlo explícito que
+        # mostrarle a Diego las ausencias del lado equivocado en silencio.
+        return Veredicto(True, f"{etiqueta_mercado} — señal cualitativa, no de frecuencia",
+                         f"No se pudo emparejar \"{seleccion}\" con \"{home}\" ni \"{away}\" — "
+                         "revisar si el partido elegido es el correcto")
+
+    lado = "local" if es_local else "visitante"
     partes = []
-    if es_local or es_visita:
-        f = forma_home if es_local else forma_away
-        f_riv = forma_away if es_local else forma_home
-        partes.append(f"Forma propia: {f.forma_str or 'N/A'} vs forma rival: {f_riv.forma_str or 'N/A'}")
+    f = forma_home if es_local else forma_away
+    f_riv = forma_away if es_local else forma_home
+    partes.append(f"Forma propia: {f.forma_str or 'N/A'} vs forma rival: {f_riv.forma_str or 'N/A'}")
     if ausencias:
         lado_aus = ausencias.get("home" if es_local else "away", [])
         if lado_aus:
             nombres = ", ".join(a["nombre"] for a in lado_aus[:3])
             partes.append(f"⚠️ Bajas: {nombres}" + (f" y {len(lado_aus)-3} más" if len(lado_aus) > 3 else ""))
-    return Veredicto(True, f"{etiqueta_mercado} — señal cualitativa, no de frecuencia (eso lo hace mejor "
-                          "sharp_ev.py/combo_builder.py para picks del ciclo automático)",
-                     " | ".join(partes) if partes else "Sin datos adicionales")
+
+    cuota_ref = (odds_referencia or {}).get(lado)
+    if cuota_ref:
+        prob_ref = 1.0 / cuota_ref
+        prob_ofrecida = 1.0 / cuota
+        margen = prob_ref - prob_ofrecida   # >0 = tu cuota paga más de lo que sugiere la referencia
+        veredicto = ("tu cuota paga bastante más que la referencia — posible valor" if margen > 0.03 else
+                    "tu cuota paga menos o igual que la referencia — sin ventaja aparente" if margen < -0.01 else
+                    "tu cuota está en línea con la referencia")
+        return Veredicto(True,
+                         f"{etiqueta_mercado} — referencia Sofascore/bet365: {cuota_ref} vs tu cuota {cuota} — {veredicto}",
+                         " | ".join(partes))
+
+    return Veredicto(True, f"{etiqueta_mercado} — señal cualitativa, no de frecuencia (sin cuota de referencia "
+                          "para este partido — eso lo hace mejor sharp_ev.py/combo_builder.py para picks del "
+                          "ciclo automático)",
+                     " | ".join(partes))
 
 
 def analizar_pick(pick: dict, contexto: dict) -> Veredicto:
@@ -255,9 +307,19 @@ def analizar_pick(pick: dict, contexto: dict) -> Veredicto:
         if v:
             return v
 
+    if "marcar" in mercado or "anota" in mercado:
+        v = _analizar_marca(seleccion, cuota, contexto["hist_home"], contexto["hist_away"], alcance)
+        if v:
+            return v
+        if alcance == "total":
+            return Veredicto(False, "Sin datos para cruzar este mercado todavía",
+                            "\"Marcará\" es de UN equipo puntual — al agregarla manual, elegí "
+                            "local o visita en vez de \"General / total del partido\"")
+
     if "1x2" in mercado:
         return _analizar_ganador(seleccion, cuota, contexto["home"], contexto["away"],
-                                contexto["forma_home"], contexto["forma_away"], contexto.get("ausencias"), "1X2")
+                                contexto["forma_home"], contexto["forma_away"], contexto.get("ausencias"), "1X2",
+                                contexto.get("odds_referencia"))
 
     if "sin empate" in mercado or "draw no bet" in mercado:
         return _analizar_ganador(seleccion, cuota, contexto["home"], contexto["away"],

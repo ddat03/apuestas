@@ -54,14 +54,29 @@ def _h2h_cache(home: str, away: str, start_ts: int):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _ausencias_cache(home: str, away: str, start_ts: int):
+def _evento_id_cache(home: str, away: str, start_ts: int):
+    """Id de Sofascore del partido puntual — lo reusan ausencias y la
+    cuota de referencia (odds_1x2_evento) para no buscar el evento dos
+    veces."""
     home_id = sc.buscar_equipo_id(home)
     if not home_id:
         return None
     from datetime import datetime, timezone
     commence_iso = datetime.fromtimestamp(start_ts, tz=timezone.utc).isoformat()
     evento = sc.buscar_evento_proximo(home_id, away, commence_iso)
-    return sc.ausencias_equipo(evento["id"]) if evento else None
+    return evento["id"] if evento else None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _ausencias_cache(home: str, away: str, start_ts: int):
+    evento_id = _evento_id_cache(home, away, start_ts)
+    return sc.ausencias_equipo(evento_id) if evento_id else None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _odds_referencia_cache(home: str, away: str, start_ts: int):
+    evento_id = _evento_id_cache(home, away, start_ts)
+    return sc.odds_1x2_evento(evento_id) if evento_id else None
 
 
 def _sync_checkbox(key: str, pick: dict) -> None:
@@ -168,6 +183,26 @@ etiqueta = st.selectbox("Elegí un partido (clic y escribí para buscar)", list(
 elegido = opciones[etiqueta]
 partido_label = f"{elegido['home']} vs {elegido['away']}"
 
+# Datos de Sofascore de este partido, una sola vez acá (cache de por
+# medio — no pega de nuevo a la red) para que los use tanto "Agregar
+# manual" (su propio botón Analizar) como el Analizar de más abajo.
+stats_home = _stats_cache(elegido["home"])
+stats_away = _stats_cache(elegido["away"])
+ausencias = _ausencias_cache(elegido["home"], elegido["away"], elegido["start_ts"])
+odds_referencia = _odds_referencia_cache(elegido["home"], elegido["away"], elegido["start_ts"])
+contexto = {
+    "home": elegido["home"], "away": elegido["away"],
+    "forma_home": stats_home["forma"], "forma_away": stats_away["forma"],
+    "hist_home": stats_home["historial"], "hist_away": stats_away["historial"],
+    "ausencias": ausencias,
+    "odds_referencia": odds_referencia,
+}
+
+if odds_referencia:
+    st.caption(f"📊 Cuota 1X2 de referencia (Sofascore/bet365 — no es la cuota real de 1xbet/Ecuabet, "
+              f"sirve para comparar): Local {odds_referencia.get('local','?')} · "
+              f"Empate {odds_referencia.get('empate','?')} · Visitante {odds_referencia.get('visitante','?')}")
+
 st.divider()
 
 # ── Cuotas ────────────────────────────────────────────────
@@ -211,6 +246,10 @@ with col_ec:
                "\"➕ Agregar manual\" más abajo.")
 
 with st.expander("➕ Agregar manual (para lo que no sale arriba, ej. corners/tarjetas/jugador de Ecuabet)"):
+    st.caption("Aparte de las de arriba: se guarda al carrito Y tiene su propio botón Analizar acá mismo "
+              "(antes compartía el botón Analizar de más abajo y se perdía al hacer clic — el checkbox "
+              "y el formulario son dos envíos distintos para Streamlit, así que lo que se armaba en uno "
+              "no sobrevivía al otro).")
     with st.form("form_manual", clear_on_submit=True):
         c1, c2, c3 = st.columns(3)
         m_mercado = c1.text_input("Mercado", placeholder="Tiros esquina")
@@ -222,7 +261,6 @@ with st.expander("➕ Agregar manual (para lo que no sale arriba, ej. corners/ta
             [f"{elegido['home']} (local)", f"{elegido['away']} (visita)", "General / total del partido"],
             horizontal=True,
         )
-        m_tambien_analizar = st.checkbox("También marcarla para analizar ahora", value=True)
         if st.form_submit_button("Agregar al carrito"):
             m_equipo = ("home" if m_alcance_label.startswith(elegido["home"]) else
                        "away" if m_alcance_label.startswith(elegido["away"]) else "total")
@@ -230,21 +268,31 @@ with st.expander("➕ Agregar manual (para lo que no sale arriba, ej. corners/ta
                           "mercado": m_mercado or "Manual", "seleccion": m_seleccion, "cuota": m_cuota,
                           "equipo": m_equipo}
             cm.agregar_a_carrito(pick_manual)
-            if m_tambien_analizar:
-                picks_analizar.append(pick_manual)
+            st.session_state["ultimo_pick_manual"] = pick_manual
+
+    ultimo_manual = st.session_state.get("ultimo_pick_manual")
+    if ultimo_manual and ultimo_manual["partido"] == partido_label:
+        st.markdown(f"**Última agregada acá:** {ultimo_manual['mercado']} — "
+                   f"**{ultimo_manual['seleccion']}** (cuota {ultimo_manual['cuota']})")
+        if st.button("🔍 Analizar esta apuesta manual"):
+            v_manual = ma.analizar_pick(ultimo_manual, contexto)
+            with st.container(border=True):
+                if v_manual.analizable:
+                    st.write(v_manual.resumen)
+                    if v_manual.detalle:
+                        st.caption(v_manual.detalle)
+                else:
+                    st.info(v_manual.resumen)
 
 st.divider()
 
 # ── Estadísticas ──────────────────────────────────────────
 st.subheader(f"Estadísticas (Sofascore, últimos {ap.N_HISTORIAL} partidos)")
 col_home, col_away = st.columns(2)
-stats_por_lado = {}
 
-for col, lado, nombre in ((col_home, "home", elegido["home"]), (col_away, "away", elegido["away"])):
+for col, nombre, stats in ((col_home, elegido["home"], stats_home), (col_away, elegido["away"], stats_away)):
     with col:
         st.markdown(f"#### {nombre}")
-        stats = _stats_cache(nombre)
-        stats_por_lado[lado] = stats
         if not stats["equipo_id"]:
             st.warning("No encontrado en Sofascore")
             continue
@@ -278,7 +326,6 @@ for col, lado, nombre in ((col_home, "home", elegido["home"]), (col_away, "away"
         else:
             st.caption("Sin historial de estadísticas disponible")
 
-ausencias = _ausencias_cache(elegido["home"], elegido["away"], elegido["start_ts"])
 if ausencias and (ausencias["home"] or ausencias["away"]):
     st.markdown("#### ⚠️ Ausencias / lesionados")
     col_ah, col_aa = st.columns(2)
@@ -312,17 +359,9 @@ picks_este_partido = picks_analizar
 if not picks_este_partido:
     st.caption("Marcá alguna selección con 🔍 arriba para poder analizarla.")
 elif st.button("Analizar", type="primary"):
-    home_stats = stats_por_lado.get("home", {})
-    away_stats = stats_por_lado.get("away", {})
-    if not home_stats.get("equipo_id") or not away_stats.get("equipo_id"):
+    if not stats_home.get("equipo_id") or not stats_away.get("equipo_id"):
         st.warning("Faltan datos de Sofascore de alguno de los dos equipos — no se puede analizar.")
     else:
-        contexto = {
-            "home": elegido["home"], "away": elegido["away"],
-            "forma_home": home_stats["forma"], "forma_away": away_stats["forma"],
-            "hist_home": home_stats["historial"], "hist_away": away_stats["historial"],
-            "ausencias": ausencias,
-        }
         for p in picks_este_partido:
             v = ma.analizar_pick(p, contexto)
             with st.container(border=True):

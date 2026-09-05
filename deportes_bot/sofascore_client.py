@@ -40,17 +40,23 @@ log = logging.getLogger("SofascoreClient")
 BASE = "https://www.sofascore.com/api/v1"
 IMPERSONATE = "chrome124"
 TIMEOUT = 15
+REINTENTOS = 2   # Sofascore tira timeouts transitorios de vez en cuando (visto en
+                 # producción) — sin reintento, un solo hipo de red hacía ver un
+                 # equipo real como "sin datos", que parecía un bug y no lo era.
 
 
 def _get(path: str) -> dict | None:
-    try:
-        r = creq.get(f"{BASE}{path}", impersonate=IMPERSONATE, timeout=TIMEOUT)
-        if r.status_code != 200:
-            return None
-        return r.json()
-    except Exception as e:
-        log.warning(f"{path}: {e}")
-        return None
+    ultimo_error = None
+    for intento in range(REINTENTOS + 1):
+        try:
+            r = creq.get(f"{BASE}{path}", impersonate=IMPERSONATE, timeout=TIMEOUT)
+            if r.status_code != 200:
+                return None   # 404/403 no son transitorios — reintentar no ayuda
+            return r.json()
+        except Exception as e:
+            ultimo_error = e
+    log.warning(f"{path}: {ultimo_error} (tras {REINTENTOS + 1} intentos)")
+    return None
 
 
 def _normalizar(nombre: str) -> str:
@@ -190,6 +196,37 @@ def h2h_evento(event_id: int, home_nombre: str, away_nombre: str) -> H2H:
         f"{away_nombre} (últimos {h2h.partidos_totales})"
     )
     return h2h
+
+
+def odds_1x2_evento(event_id: int) -> dict | None:
+    """Cuota 1X2 de referencia para este evento puntual — sale del
+    proveedor por defecto de Sofascore (en la práctica, bet365 para la
+    mayoría de ligas). NO es la cuota real de 1xbet/Ecuabet — sirve
+    como ancla de mercado independiente para comparar contra la que
+    ofrece el libro real, mismo espíritu que sharp_ev.py usa a
+    Pinnacle, pero con lo que Sofascore ya expone sin key.
+    {"local": cuota, "empate": cuota, "visitante": cuota} o None."""
+    data = _get(f"/event/{event_id}/odds/1/all")
+    if not data:
+        return None
+    mercado = next((m for m in data.get("markets", [])
+                    if m.get("marketId") == 1 and m.get("marketGroup") == "1X2"), None)
+    if not mercado:
+        return None
+
+    mapa_nombre = {"1": "local", "X": "empate", "2": "visitante"}
+    cuotas = {}
+    for c in mercado.get("choices", []):
+        nombre = mapa_nombre.get(c.get("name"))
+        frac = c.get("fractionalValue", "")
+        if not nombre or "/" not in frac:
+            continue
+        try:
+            num, den = frac.split("/")
+            cuotas[nombre] = round(1.0 + float(num) / float(den), 3)
+        except (ValueError, ZeroDivisionError):
+            continue
+    return cuotas or None
 
 
 # Claves de /event/{id}/statistics que interesan para el análisis
