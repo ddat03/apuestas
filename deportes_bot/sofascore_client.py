@@ -190,3 +190,199 @@ def h2h_evento(event_id: int, home_nombre: str, away_nombre: str) -> H2H:
         f"{away_nombre} (últimos {h2h.partidos_totales})"
     )
     return h2h
+
+
+# Claves de /event/{id}/statistics que interesan para el análisis
+# (de las ~40 que trae ese endpoint — pases, duelos, sprints, etc.
+# se dejan afuera por no tener mercado de apuesta asociado).
+_CLAVES_STATS = {
+    "posesion":        "ballPossession",
+    "goles_esperados": "expectedGoals",
+    "tiros_totales":   "totalShotsOnGoal",
+    "tiros_arco":      "shotsOnGoal",
+    "ocasiones_claras": "bigChanceCreated",
+    "corners":         "cornerKicks",
+    "amarillas":       "yellowCards",
+    "rojas":           "redCards",
+    "faltas":          "fouls",
+}
+
+
+def stats_partido(event_id: int) -> dict[str, tuple[int, int]] | None:
+    """Corners/tarjetas/tiros/faltas de un partido YA JUGADO, como
+    (valor_local, valor_visitante). None si el partido no tiene
+    estadísticas cargadas todavía (evento futuro o recién terminado)."""
+    data = _get(f"/event/{event_id}/statistics")
+    if not data or not data.get("statistics"):
+        return None
+
+    items = {}
+    for grupo in data["statistics"][0].get("groups", []):
+        for it in grupo.get("statisticsItems", []):
+            items.setdefault(it["key"], it)
+
+    resultado = {}
+    for etiqueta, clave in _CLAVES_STATS.items():
+        it = items.get(clave)
+        if it is not None:
+            resultado[etiqueta] = (it.get("homeValue", 0) or 0, it.get("awayValue", 0) or 0)
+    return resultado or None
+
+
+def posicion_equipo(equipo_id: int) -> dict | None:
+    """Posición actual en la tabla — sale del torneo/temporada del
+    PRÓXIMO partido del equipo (no del último jugado: a comienzos de
+    temporada el último jugado puede ser todavía de la temporada
+    anterior, y ahí la tabla que importa es la de la temporada nueva).
+    No todos los torneos tienen tabla (ej. copas eliminatorias) — en
+    ese caso devuelve None."""
+    data = _get(f"/team/{equipo_id}/events/next/0")
+    partido = data.get("events", [None])[0] if data and data.get("events") else None
+    if not partido:
+        return None
+
+    torneo_id = partido.get("tournament", {}).get("uniqueTournament", {}).get("id")
+    temporada_id = partido.get("season", {}).get("id")
+    if not torneo_id or not temporada_id:
+        return None
+
+    tabla = _get(f"/unique-tournament/{torneo_id}/season/{temporada_id}/standings/total")
+    if not tabla:
+        return None
+
+    for grupo in tabla.get("standings", []):
+        for fila in grupo.get("rows", []):
+            if fila.get("team", {}).get("id") == equipo_id:
+                return {
+                    "posicion": fila.get("position"),
+                    "puntos": fila.get("points"),
+                    "jugados": fila.get("matches"),
+                    "ganados": fila.get("wins"),
+                    "empatados": fila.get("draws"),
+                    "perdidos": fila.get("losses"),
+                    "total_equipos": sum(len(g.get("rows", [])) for g in tabla.get("standings", [])),
+                }
+    return None
+
+
+def jugadores_partido(event_id: int) -> dict:
+    """Plantel de un partido (titulares + suplentes) — sirve para
+    poblar un selector de jugador real en vez de buscar por nombre
+    (nombres repetidos entre jugadores son un riesgo real, ver
+    ausencias_equipo). {"home": [{"id","name","posicion"}], "away": [...]}"""
+    data = _get(f"/event/{event_id}/lineups")
+    if not data:
+        return {"home": [], "away": []}
+    salida = {}
+    for lado in ("home", "away"):
+        salida[lado] = [
+            {"id": p["player"]["id"], "name": p["player"]["name"], "posicion": p["player"].get("position", "")}
+            for p in data.get(lado, {}).get("players", [])
+        ]
+    return salida
+
+
+def ausencias_equipo(event_id: int) -> dict:
+    """Lesionados/suspendidos de cada lado para ESE partido puntual
+    (Sofascore la calcula incluso antes de que se confirme la
+    alineación). {"home": [{"nombre","motivo","vuelve"}], "away": [...]}"""
+    data = _get(f"/event/{event_id}/lineups")
+    if not data:
+        return {"home": [], "away": []}
+    salida = {}
+    for lado in ("home", "away"):
+        salida[lado] = [
+            {
+                "nombre": a["player"]["name"],
+                "motivo": a.get("description", ""),
+                "vuelve": a.get("expectedEndDate"),
+            }
+            for a in data.get(lado, {}).get("missingPlayers", [])
+        ]
+    return salida
+
+
+def buscar_jugador_id(nombre: str) -> int | None:
+    """OJO: nombres de jugador se repiten entre personas distintas
+    (ver ejemplo real: 3 "Bruno Guimarães" distintos en la búsqueda).
+    Preferir jugadores_partido() para elegir de una lista real del
+    partido en vez de esto cuando haya alternativa."""
+    data = _get(f"/search/all?q={nombre}")
+    if not data:
+        return None
+    for res in data.get("results", []):
+        if res.get("type") == "player" and res.get("entity", {}).get("sport", {}).get("id") == 1:
+            return res["entity"].get("id")
+    return None
+
+
+def historial_stats_jugador(jugador_id: int, n: int = 5) -> list[dict]:
+    """Últimos `n` partidos JUGADOS (minutos > 0) del jugador, con
+    tiros/tiros al arco/goles — 1 request por partido además de la
+    lista (recorre el lineup completo del evento para encontrarlo)."""
+    data = _get(f"/player/{jugador_id}/events/last/0")
+    if not data:
+        return []
+
+    mapa_equipo = data.get("playedForTeamMap", {})
+    historial = []
+    for e in data.get("events", []):
+        if e.get("status", {}).get("type") != "finished":
+            continue
+        equipo_id = mapa_equipo.get(str(e["id"]))
+        lineup = _get(f"/event/{e['id']}/lineups")
+        if not lineup or not equipo_id:
+            continue
+        lado = "home" if e.get("homeTeam", {}).get("id") == equipo_id else "away"
+        jugador = next((p for p in lineup.get(lado, {}).get("players", [])
+                        if p["player"]["id"] == jugador_id), None)
+        if not jugador:
+            continue
+        st = jugador.get("statistics", {})
+        if not st.get("minutesPlayed"):
+            continue
+        rival = e["awayTeam"]["name"] if lado == "home" else e["homeTeam"]["name"]
+        historial.append({
+            "rival": rival, "minutos": st.get("minutesPlayed"),
+            "tiros": st.get("totalShots"), "tiros_arco": st.get("onTargetScoringAttempt"),
+            "goles": st.get("goals"), "asistencias": st.get("goalAssist"),
+            "rating": st.get("rating"),
+        })
+        if len(historial) >= n:
+            break
+    return historial
+
+
+def historial_stats_equipo(equipo_id: int, n: int = 5) -> list[dict]:
+    """Últimos `n` partidos TERMINADOS del equipo con sus stats
+    (corners/tarjetas/tiros a favor y en contra). Cada entrada:
+    {"rival": str, "a_favor": {...}, "en_contra": {...}}.
+
+    Cuesta 1 request por partido de historial además de la lista —
+    con n=5 son 6 requests por equipo. Se usa solo bajo demanda
+    (analizar_partido.py), no en el ciclo automático de sharp_live.py."""
+    data = _get(f"/team/{equipo_id}/events/last/0")
+    if not data:
+        return []
+
+    partidos = [e for e in data.get("events", []) if e.get("status", {}).get("type") == "finished"][:n]
+    historial = []
+    for e in partidos:
+        stats = stats_partido(e["id"])
+        if not stats:
+            continue
+        es_local = e.get("homeTeam", {}).get("id") == equipo_id
+        rival = e["awayTeam"]["name"] if es_local else e["homeTeam"]["name"]
+        a_favor   = {k: (v[0] if es_local else v[1]) for k, v in stats.items()}
+        en_contra = {k: (v[1] if es_local else v[0]) for k, v in stats.items()}
+
+        gh = e.get("homeScore", {}).get("current")
+        ga = e.get("awayScore", {}).get("current")
+        goles_favor   = gh if es_local else ga
+        goles_contra  = ga if es_local else gh
+
+        historial.append({
+            "rival": rival, "a_favor": a_favor, "en_contra": en_contra,
+            "goles_favor": goles_favor, "goles_contra": goles_contra,
+        })
+    return historial
