@@ -121,7 +121,16 @@ def forma_equipo(equipo_id: int, equipo_nombre: str, n: int = 5) -> FormaEquipo:
     if not data:
         return forma
 
-    partidos = [e for e in data.get("events", []) if e.get("status", {}).get("type") == "finished"][:n]
+    # OJO: este endpoint devuelve la ventana en orden ASCENDENTE (más
+    # viejo primero) — un [:n] directo traía los partidos más VIEJOS
+    # de la ventana, no los últimos jugados (bug real, detectado con
+    # Arsenal mostrando un partido de 2013 vs Wigan como "reciente").
+    # Se ordena explícito por fecha en vez de confiar en el orden del
+    # endpoint, para no depender de que no lo cambien en el futuro.
+    partidos = sorted(
+        (e for e in data.get("events", []) if e.get("status", {}).get("type") == "finished"),
+        key=lambda e: e.get("startTimestamp", 0), reverse=True,
+    )[:n]
     forma.partidos = len(partidos)
     simbolos = []
 
@@ -361,9 +370,13 @@ def historial_stats_jugador(jugador_id: int, n: int = 5) -> list[dict]:
     if not data:
         return []
 
+    # Mismo orden ascendente que en forma_equipo/historial_stats_equipo
+    # (ver el comentario ahí) — ordenar explícito por fecha.
+    eventos_ordenados = sorted(data.get("events", []), key=lambda e: e.get("startTimestamp", 0), reverse=True)
+
     mapa_equipo = data.get("playedForTeamMap", {})
     historial = []
-    for e in data.get("events", []):
+    for e in eventos_ordenados:
         if e.get("status", {}).get("type") != "finished":
             continue
         equipo_id = mapa_equipo.get(str(e["id"]))
@@ -402,7 +415,12 @@ def historial_stats_equipo(equipo_id: int, n: int = 5) -> list[dict]:
     if not data:
         return []
 
-    partidos = [e for e in data.get("events", []) if e.get("status", {}).get("type") == "finished"][:n]
+    # Mismo orden ascendente que en forma_equipo — ordenar explícito
+    # por fecha en vez de confiar en el orden del endpoint.
+    partidos = sorted(
+        (e for e in data.get("events", []) if e.get("status", {}).get("type") == "finished"),
+        key=lambda e: e.get("startTimestamp", 0), reverse=True,
+    )[:n]
     historial = []
     for e in partidos:
         stats = stats_partido(e["id"])
