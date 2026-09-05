@@ -162,7 +162,9 @@ opciones = {
     f"{p['home']} vs {p['away']}  ({p['liga']})" + ("  [1xbet+Ecuabet]" if p["raw_ec"] else "  [solo 1xbet]"): p
     for p in partidos
 }
-etiqueta = st.selectbox("Elegí un partido", list(opciones.keys()))
+# filter_mode="fuzzy" (default) ya filtra al instante mientras escribís,
+# sin ida y vuelta al servidor — clic acá y escribí, ej. "hull" o "premier".
+etiqueta = st.selectbox("Elegí un partido (clic y escribí para buscar)", list(opciones.keys()))
 elegido = opciones[etiqueta]
 partido_label = f"{elegido['home']} vs {elegido['away']}"
 

@@ -197,8 +197,12 @@ def _mismo_equipo(a: str, b: str) -> bool:
     return na == nb or na in nb or nb in na
 
 
-def _analizar_1x2(seleccion: str, cuota: float, home: str, away: str,
-                  forma_home, forma_away, ausencias: dict | None) -> Veredicto:
+def _analizar_ganador(seleccion: str, cuota: float, home: str, away: str,
+                      forma_home, forma_away, ausencias: dict | None, etiqueta_mercado: str) -> Veredicto:
+    """Sirve tanto para 1X2 como para "Pronóstico sin empate" (Draw No
+    Bet) — en los dos la selección es un nombre de equipo, y la señal
+    que podemos dar es la misma (cualitativa: forma + ausencias, no
+    frecuencia — eso lo hace mejor sharp_ev.py/combo_builder.py)."""
     es_local = _mismo_equipo(seleccion, home)
     es_visita = not es_local and _mismo_equipo(seleccion, away)
     partes = []
@@ -211,8 +215,9 @@ def _analizar_1x2(seleccion: str, cuota: float, home: str, away: str,
         if lado_aus:
             nombres = ", ".join(a["nombre"] for a in lado_aus[:3])
             partes.append(f"⚠️ Bajas: {nombres}" + (f" y {len(lado_aus)-3} más" if len(lado_aus) > 3 else ""))
-    return Veredicto(True, "1X2 — señal cualitativa, no de frecuencia (eso lo hace mejor sharp_ev.py/combo_builder.py "
-                          "para picks del ciclo automático)", " | ".join(partes) if partes else "Sin datos adicionales")
+    return Veredicto(True, f"{etiqueta_mercado} — señal cualitativa, no de frecuencia (eso lo hace mejor "
+                          "sharp_ev.py/combo_builder.py para picks del ciclo automático)",
+                     " | ".join(partes) if partes else "Sin datos adicionales")
 
 
 def analizar_pick(pick: dict, contexto: dict) -> Veredicto:
@@ -251,8 +256,13 @@ def analizar_pick(pick: dict, contexto: dict) -> Veredicto:
             return v
 
     if "1x2" in mercado:
-        return _analizar_1x2(seleccion, cuota, contexto["home"], contexto["away"],
-                            contexto["forma_home"], contexto["forma_away"], contexto.get("ausencias"))
+        return _analizar_ganador(seleccion, cuota, contexto["home"], contexto["away"],
+                                contexto["forma_home"], contexto["forma_away"], contexto.get("ausencias"), "1X2")
+
+    if "sin empate" in mercado or "draw no bet" in mercado:
+        return _analizar_ganador(seleccion, cuota, contexto["home"], contexto["away"],
+                                contexto["forma_home"], contexto["forma_away"], contexto.get("ausencias"),
+                                "Pronóstico sin empate")
 
     return Veredicto(False, "Sin datos para cruzar este mercado todavía",
                      "No es un error — simplemente no tenemos una fuente estadística mapeada a esta selección")
