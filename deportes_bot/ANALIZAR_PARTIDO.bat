@@ -3,12 +3,14 @@ title Analizar Partido - dashboard
 cd /d "%~dp0"
 
 echo ==========================================================
-echo  ANALIZAR PARTIDO
+echo  DASHBOARD APUESTAS
 echo  Creado por Diego Aleman
 echo ----------------------------------------------------------
-echo  Cuotas reales de 1xbet + Ecuabet, forma/tabla/H2H/corners-
-echo  tarjetas-tiros de Sofascore. Solo muestra datos - no aposta
-echo  nada solo. Se abre solo en el navegador (~30s la 1ra carga).
+echo  Pestana 1 - Analizar Partido: cuotas 1xbet+Ecuabet + stats
+echo    de Sofascore (forma/tabla/H2H/corners/tarjetas/tiros).
+echo  Pestana 2 - Combinada PrimaTips: tips O menor a 1.3 de
+echo    primatips.com cruzados con Ecuabet, cuota combinada total.
+echo  Solo muestra datos - no aposta nada solo.
 echo ==========================================================
 echo.
 

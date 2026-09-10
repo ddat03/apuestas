@@ -152,6 +152,34 @@ def guardar_combinada() -> int | None:
     return combo_id
 
 
+def guardar_combinada_directa(patas: list[dict], cuota_total: float | None = None) -> int | None:
+    """Guarda una combinada YA armada (ej. la de PrimaTips) sin pasar
+    por el carrito manual. `patas`: [{partido, liga, casa, mercado,
+    seleccion, cuota}, ...]. None si la lista está vacía."""
+    if not patas:
+        return None
+    if cuota_total is None:
+        cuota_total = 1.0
+        for p in patas:
+            cuota_total *= p["cuota"]
+        cuota_total = round(cuota_total, 3)
+
+    with _conn() as con:
+        cur = con.execute(
+            "INSERT INTO combos (creado_en, cuota_total, estado) VALUES (?,?,?)",
+            (datetime.now(timezone.utc).isoformat(), cuota_total, "pendiente"),
+        )
+        combo_id = cur.lastrowid
+        for p in patas:
+            con.execute(
+                "INSERT INTO combo_picks (combo_id, partido, liga, casa, mercado, seleccion, cuota) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (combo_id, p["partido"], p.get("liga", ""), p["casa"], p["mercado"],
+                 p["seleccion"], p["cuota"]),
+            )
+    return combo_id
+
+
 def listar_combinadas() -> list[dict]:
     """Más nuevas primero. Cada una con sus patas anidadas en 'patas'."""
     with _conn() as con:
