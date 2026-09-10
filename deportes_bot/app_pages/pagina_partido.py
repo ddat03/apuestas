@@ -172,7 +172,14 @@ if col_boton.button("🔄 Recargar partidos", help="Limpia TODO el caché (parti
     _odds_referencia_cache.clear()
     st.rerun()
 
-partidos = _partidos_cache()
+try:
+    partidos = _partidos_cache()
+except Exception as e:
+    st.error(f"1xbet o Ecuabet no respondieron (suele ser un pico momentáneo). {type(e).__name__}")
+    if st.button("🔄 Reintentar", key="retry_partidos"):
+        _partidos_cache.clear()
+        st.rerun()
+    st.stop()
 
 opciones = {
     f"{p['home']} vs {p['away']}  ({p['liga']})" + ("  [1xbet+Ecuabet]" if p["raw_ec"] else "  [solo 1xbet]"): p

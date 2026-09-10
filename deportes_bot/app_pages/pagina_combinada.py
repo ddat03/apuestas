@@ -73,7 +73,15 @@ if not tips:
     st.warning(f"PrimaTips no tiene tips para {fecha_iso} todavía.")
     st.stop()
 
-ecuabet_ctx = _ecuabet_cache()
+try:
+    ecuabet_ctx = _ecuabet_cache()
+except Exception as e:
+    st.error(f"Ecuabet no respondió (suele ser un pico momentáneo del servidor). {type(e).__name__}")
+    if st.button("🔄 Reintentar"):
+        _ecuabet_cache.clear()
+        st.rerun()
+    st.stop()
+
 cruzadas = pc.cruzar_con_ecuabet(tips, fecha_iso, ecuabet_ctx, ap.get_mercados_ecuabet)
 combo = pc.armar_combinada(cruzadas, umbral=umbral)
 

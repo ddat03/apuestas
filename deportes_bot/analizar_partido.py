@@ -39,6 +39,7 @@
 #    python analizar_partido.py
 # ============================================================
 
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -87,19 +88,39 @@ MERCADOS_1XBET_CONOCIDOS = {
 #  mostrar los demás mercados y los stats más adelante)
 # ────────────────────────────────────────────────────────────
 
+def _get_json(url: str, params: dict, headers: dict, timeout: int = 20, reintentos: int = 2):
+    """GET con reintentos ante 5xx / timeouts (Ecuabet y 1xbet tiran
+    504/timeout momentáneos y sin esto se caía toda la página)."""
+    ultimo = None
+    for i in range(reintentos):
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            ultimo = e
+            code = getattr(getattr(e, "response", None), "status_code", None)
+            if code is not None and 400 <= code < 500 and code != 429:
+                raise   # 4xx (salvo 429): reintentar no ayuda
+            time.sleep(1.5 * (i + 1))
+    raise ultimo
+
+
 def _cargar_1xbet_raw(count: int = 50) -> list[dict]:
     url = "https://1xbet.ec/service-api/main-line-feed/v3/games1x2"
     params = {"cfView": 3, "count": count, "country": 209, "fcountry": 209,
               "gr": 285, "grMode": 4, "lng": "es", "ref": 1}
-    r = requests.get(url, params=params, headers=HEADERS_1XBET, timeout=20)
-    r.raise_for_status()
-    return r.json()
+    return _get_json(url, params, HEADERS_1XBET)
 
 
 def _cargar_ecuabet_raw(paginas: int = PAGINAS_ECUABET, eventos_por_pagina: int = 50) -> dict:
     """Devuelve {events, markets, odds, competidores} ya fusionados de
     varias páginas de GetUpcoming. Con cobertura completa (~1850
-    partidos) esto tarda ~30s — se paga una sola vez al arrancar."""
+    partidos) esto tarda ~30s — se paga una sola vez al arrancar.
+
+    Si una página falla tras los reintentos, se corta la paginación y
+    se devuelve lo juntado hasta ahí (cobertura parcial > caída total).
+    Solo re-lanza si ni la primera página anduvo."""
     events, markets_por_id, odds_por_id, competidores = [], {}, {}, {}
     for page in range(1, paginas + 1):
         url = "https://sb2frontend-altenar2.biahosted.com/api/widget/GetUpcoming"
@@ -108,9 +129,12 @@ def _cargar_ecuabet_raw(paginas: int = PAGINAS_ECUABET, eventos_por_pagina: int 
             "deviceType": 1, "numFormat": "en-GB", "countryCode": "EC",
             "eventCount": eventos_por_pagina, "sportId": 66, "page": page,
         }
-        r = requests.get(url, params=params, headers=HEADERS_ECUABET, timeout=20)
-        r.raise_for_status()
-        data = r.json()
+        try:
+            data = _get_json(url, params, HEADERS_ECUABET)
+        except requests.RequestException:
+            if not events:
+                raise
+            break   # cobertura parcial
         events.extend(data.get("events", []))
         markets_por_id.update({m["id"]: m for m in data.get("markets", [])})
         odds_por_id.update({o["id"]: o for o in data.get("odds", [])})
