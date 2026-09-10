@@ -29,7 +29,7 @@
 import logging
 import re
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timezone
 
 from curl_cffi import requests as creq
 
@@ -59,8 +59,14 @@ def _get(path: str) -> dict | None:
     return None
 
 
+_NORDICO = str.maketrans({"ø": "o", "Ø": "o", "æ": "ae", "Æ": "ae", "å": "a", "Å": "a",
+                          "ð": "d", "Ð": "d", "þ": "th", "Þ": "th", "ł": "l", "Ł": "l"})
+
+
 def _normalizar(nombre: str) -> str:
-    n = unicodedata.normalize("NFKD", nombre or "").encode("ascii", "ignore").decode().lower()
+    n = (nombre or "").translate(_NORDICO)
+    n = unicodedata.normalize("NFKD", n).encode("ascii", "ignore").decode().lower()
+    n = re.sub(r"[/\-.'`]", " ", n)   # "Bodo/Glimt" -> "bodo glimt", "St. Louis" -> "st louis"
     for suf in (" fc", " cf", " sc", " afc", " ac", "fc ", "cf "):
         n = n.replace(suf, " ")
     return re.sub(r"\s+", " ", n).strip()
@@ -70,7 +76,15 @@ def _mismo_equipo(a: str, b: str) -> bool:
     na, nb = _normalizar(a), _normalizar(b)
     if not na or not nb:
         return False
-    return na == nb or na in nb or nb in na
+    if na == nb or na in nb or nb in na:
+        return True
+    # última chance: todas las palabras (>1 letra) de la más corta están
+    # en la otra, y son 2+ (evita el falso positivo de compartir una sola
+    # palabra genérica como "Toronto")
+    ta = {w for w in na.split() if len(w) > 1}
+    tb = {w for w in nb.split() if len(w) > 1}
+    chico, grande = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    return len(chico) >= 2 and chico <= grande
 
 
 def buscar_equipo_id(nombre: str) -> int | None:
@@ -109,6 +123,47 @@ def buscar_evento_proximo(equipo_id: int, rival_nombre: str,
         if commence_ts and abs(ev.get("startTimestamp", 0) - commence_ts) > ventana_horas * 3600:
             continue
         return ev
+    return None
+
+
+def resultado_partido(home_nombre: str, away_nombre: str, fecha_iso: str,
+                      matcher=None) -> dict | None:
+    """Busca el partido (por nombres + fecha) en el calendario del local
+    y devuelve su estado + marcador final. Para liquidar combinadas.
+    {"status": "finished"|"notstarted"|"inprogress"|..., "gh": int|None,
+     "ga": int|None, "event_id": int, "home": str, "away": str} o None."""
+    igual = matcher or _mismo_equipo
+    home_id = buscar_equipo_id(home_nombre)
+    if not home_id:
+        return None
+    try:
+        objetivo = datetime.fromisoformat(fecha_iso).date()
+    except (ValueError, TypeError):
+        objetivo = None
+
+    for endpoint in ("last/0", "last/1", "next/0"):
+        data = _get(f"/team/{home_id}/events/{endpoint}")
+        for ev in (data or {}).get("events", []):
+            h, a = ev.get("homeTeam", {}), ev.get("awayTeam", {})
+            rival = a if h.get("id") == home_id else h
+            propio = h if h.get("id") == home_id else a
+            if not igual(rival.get("name", ""), away_nombre):
+                continue
+            if objetivo is not None:
+                ts = ev.get("startTimestamp")
+                if ts and abs((datetime.fromtimestamp(ts, tz=timezone.utc).date() - objetivo).days) > 1:
+                    continue
+            # el "home" del pick es propio; ordenar el marcador según Sofascore
+            es_local_sofa = h.get("id") == home_id
+            gh_s = ev.get("homeScore", {}).get("current")
+            ga_s = ev.get("awayScore", {}).get("current")
+            return {
+                "status": ev.get("status", {}).get("type", "unknown"),
+                "gh": gh_s if es_local_sofa else ga_s,   # goles del equipo "home" del pick
+                "ga": ga_s if es_local_sofa else gh_s,
+                "event_id": ev.get("id"),
+                "home": propio.get("name", ""), "away": rival.get("name", ""),
+            }
     return None
 
 

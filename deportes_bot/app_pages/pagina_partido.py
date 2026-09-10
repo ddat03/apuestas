@@ -24,6 +24,7 @@ import streamlit as st
 
 import analizar_partido as ap
 import combos_manual_db as cm
+import liquidador as lq
 import motor_analisis as ma
 import sofascore_client as sc
 
@@ -142,10 +143,32 @@ with st.expander("🧺 Mi combinada", expanded=True):
     guardadas = cm.listar_combinadas()
     if guardadas:
         st.markdown("**Combinadas guardadas**")
+
+        # Auto-liquidación: una vez por sesión al abrir + botón para forzar.
+        # Marca cada pata ✓/✗ mirando el marcador final en Sofascore.
+        if "combos_liquidados" not in st.session_state:
+            with st.spinner("Revisando resultados de partidos ya jugados..."):
+                cont = lq.liquidar_combinadas(cm.listar_combinadas, cm.marcar_pata_resultado)
+            st.session_state["combos_liquidados"] = True
+            if cont["acierto"] or cont["fallo"] or cont["anulado"]:
+                st.caption(f"Liquidación automática: {cont['acierto']} ✓ · {cont['fallo']} ✗ · "
+                           f"{cont['anulado']} anuladas · {cont['pendiente']} siguen pendientes.")
+            guardadas = cm.listar_combinadas()
+
+        if st.button("🔄 Actualizar resultados", key="reliquidar",
+                     help="Vuelve a revisar en Sofascore los partidos de las combinadas guardadas."):
+            with st.spinner("Revisando resultados..."):
+                lq.liquidar_combinadas(cm.listar_combinadas, cm.marcar_pata_resultado)
+            st.rerun()
+
+        _ICONO = {"acierto": "✅", "fallo": "❌", "anulado": "➖", "pendiente": "⏳"}
+        _BADGE = {"ganada": "🟢 GANADA", "perdida": "🔴 PERDIDA", "pendiente": "⏳ PENDIENTE"}
+        _OPCIONES_RES = ["pendiente", "acierto", "fallo", "anulado"]
+
         for combo in guardadas:
-            texto_patas = " + ".join(f"{p['seleccion']} ({p['cuota']})" for p in combo["patas"])
+            badge = _BADGE[cm.estado_resultado_combo(combo)]
             col_txt, col_estado = st.columns([4, 1])
-            col_txt.write(f"#{combo['id']} — cuota total **{combo['cuota_total']}** — {texto_patas}")
+            col_txt.markdown(f"**#{combo['id']}** — cuota total **{combo['cuota_total']}** — {badge}")
             estado = col_estado.radio(
                 "estado", ["pendiente", "usada", "descartada"],
                 index=["pendiente", "usada", "descartada"].index(combo["estado"]),
@@ -154,6 +177,20 @@ with st.expander("🧺 Mi combinada", expanded=True):
             if estado != combo["estado"]:
                 cm.marcar_combinada(combo["id"], estado)
                 st.rerun()
+
+            for p in combo["patas"]:
+                res = p.get("resultado", "pendiente")
+                c_ic, c_txt, c_ovr = st.columns([0.08, 0.62, 0.30])
+                c_ic.write(_ICONO.get(res, "⏳"))
+                detalle = f" · _{p['detalle_resultado']}_" if p.get("detalle_resultado") else ""
+                c_txt.caption(f"{p['partido']} — {p['seleccion']} ({p['cuota']}){detalle}")
+                nuevo = c_ovr.selectbox(
+                    "resultado", _OPCIONES_RES, index=_OPCIONES_RES.index(res) if res in _OPCIONES_RES else 0,
+                    key=f"res_pata_{p['id']}", label_visibility="collapsed",
+                )
+                if nuevo != res:
+                    cm.marcar_pata_resultado(p["id"], nuevo, "marcado a mano")
+                    st.rerun()
 
 st.divider()
 

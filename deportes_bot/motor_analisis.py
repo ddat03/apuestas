@@ -272,6 +272,54 @@ def _analizar_ganador(seleccion: str, cuota: float, home: str, away: str,
                      " | ".join(partes))
 
 
+def _novig_1x2(odds_ref: dict) -> dict | None:
+    """Quita el margen a la cuota 1X2 de referencia -> probs que suman 1."""
+    if not odds_ref or any(k not in odds_ref for k in ("local", "empate", "visitante")):
+        return None
+    inv = {k: 1.0 / odds_ref[k] for k in ("local", "empate", "visitante")}
+    s = sum(inv.values())
+    return {k: v / s for k, v in inv.items()} if s else None
+
+
+def _analizar_doble_chance(tip_code: str, cuota: float, home: str, away: str,
+                           forma_home, forma_away, ausencias: dict | None,
+                           odds_referencia: dict | None) -> Veredicto:
+    """tip_code: '1X' | '12' | 'X2'. La doble oportunidad ya es de por sí
+    alta probabilidad — lo útil es cuánto le pesa la forma en contra y
+    si la cuota de Ecuabet paga de más frente a una estimación justa."""
+    combos = {
+        "1X": ("local", "empate", f"{home} o empate"),
+        "12": ("local", "visitante", f"{home} o {away} (no empate)"),
+        "X2": ("empate", "visitante", f"empate o {away}"),
+    }
+    if tip_code not in combos:
+        return Veredicto(False, "Doble oportunidad — código no reconocido", tip_code)
+    a, b, legible = combos[tip_code]
+
+    partes = [f"Forma {home}: {forma_home.forma_str or 'N/A'} · Forma {away}: {forma_away.forma_str or 'N/A'}"]
+    if ausencias:
+        for lado, etiq in (("home", home), ("away", away)):
+            baj = ausencias.get(lado, [])
+            if baj:
+                partes.append(f"⚠️ Bajas {etiq}: " + ", ".join(x['nombre'] for x in baj[:2]))
+
+    probs = _novig_1x2(odds_referencia)
+    if probs:
+        p_fair = probs[a] + probs[b]
+        p_ofrecida = 1.0 / cuota
+        margen = p_fair - p_ofrecida
+        estado = ("la cuota de Ecuabet paga de más — posible valor" if margen > 0.02 else
+                  "la cuota está en línea con lo justo" if margen > -0.02 else
+                  "la cuota paga de menos — sin ventaja")
+        return Veredicto(True,
+                         f"Doble oportunidad {tip_code} ({legible}) — prob. justa ~{p_fair:.0%}, "
+                         f"tu cuota {cuota} implica {p_ofrecida:.0%} — {estado}",
+                         " | ".join(partes))
+    return Veredicto(True,
+                     f"Doble oportunidad {tip_code} ({legible}) — sin cuota de referencia para estimar valor",
+                     " | ".join(partes))
+
+
 def analizar_pick(pick: dict, contexto: dict) -> Veredicto:
     """pick: {mercado, seleccion, cuota, linea(opcional), equipo(opcional)}.
     `equipo`: "home" | "away" | "total"/ausente — de qué lado es la
@@ -315,6 +363,12 @@ def analizar_pick(pick: dict, contexto: dict) -> Veredicto:
             return Veredicto(False, "Sin datos para cruzar este mercado todavía",
                             "\"Marcará\" es de UN equipo puntual — al agregarla manual, elegí "
                             "local o visita en vez de \"General / total del partido\"")
+
+    if "doble oportunidad" in mercado or "double chance" in mercado:
+        codigo = (pick.get("tip") or seleccion).strip().upper()
+        return _analizar_doble_chance(codigo, cuota, contexto["home"], contexto["away"],
+                                      contexto["forma_home"], contexto["forma_away"],
+                                      contexto.get("ausencias"), contexto.get("odds_referencia"))
 
     if "1x2" in mercado:
         return _analizar_ganador(seleccion, cuota, contexto["home"], contexto["away"],

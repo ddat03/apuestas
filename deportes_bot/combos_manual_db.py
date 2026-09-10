@@ -41,16 +41,28 @@ CREATE TABLE IF NOT EXISTS combos (
 );
 
 CREATE TABLE IF NOT EXISTS combo_picks (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    combo_id    INTEGER NOT NULL REFERENCES combos(id),
-    partido     TEXT NOT NULL,
-    liga        TEXT,
-    casa        TEXT NOT NULL,
-    mercado     TEXT NOT NULL,
-    seleccion   TEXT NOT NULL,
-    cuota       REAL NOT NULL
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    combo_id          INTEGER NOT NULL REFERENCES combos(id),
+    partido           TEXT NOT NULL,
+    liga              TEXT,
+    casa              TEXT NOT NULL,
+    mercado           TEXT NOT NULL,
+    seleccion         TEXT NOT NULL,
+    cuota             REAL NOT NULL,
+    fecha             TEXT,
+    resultado         TEXT NOT NULL DEFAULT 'pendiente',  -- pendiente | acierto | fallo | anulado
+    detalle_resultado TEXT
 );
 """
+
+# columnas añadidas después del diseño original (bases viejas no las tienen)
+_MIGRACIONES = {
+    "combo_picks": {
+        "fecha": "TEXT",
+        "resultado": "TEXT NOT NULL DEFAULT 'pendiente'",
+        "detalle_resultado": "TEXT",
+    },
+}
 
 
 def _conn() -> sqlite3.Connection:
@@ -58,6 +70,11 @@ def _conn() -> sqlite3.Connection:
     con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row
     con.executescript(_SCHEMA)
+    for tabla, cols in _MIGRACIONES.items():
+        existentes = {r[1] for r in con.execute(f"PRAGMA table_info({tabla})")}
+        for col, tipo in cols.items():
+            if col not in existentes:
+                con.execute(f"ALTER TABLE {tabla} ADD COLUMN {col} {tipo}")
     return con
 
 
@@ -144,9 +161,10 @@ def guardar_combinada() -> int | None:
         combo_id = cur.lastrowid
         for p in patas:
             con.execute(
-                "INSERT INTO combo_picks (combo_id, partido, liga, casa, mercado, seleccion, cuota) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (combo_id, p["partido"], p["liga"], p["casa"], p["mercado"], p["seleccion"], p["cuota"]),
+                "INSERT INTO combo_picks (combo_id, partido, liga, casa, mercado, seleccion, cuota, fecha) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (combo_id, p["partido"], p["liga"], p["casa"], p["mercado"], p["seleccion"],
+                 p["cuota"], p.get("fecha")),
             )
         con.execute("DELETE FROM carrito")
     return combo_id
@@ -172,10 +190,10 @@ def guardar_combinada_directa(patas: list[dict], cuota_total: float | None = Non
         combo_id = cur.lastrowid
         for p in patas:
             con.execute(
-                "INSERT INTO combo_picks (combo_id, partido, liga, casa, mercado, seleccion, cuota) "
-                "VALUES (?,?,?,?,?,?,?)",
+                "INSERT INTO combo_picks (combo_id, partido, liga, casa, mercado, seleccion, cuota, fecha) "
+                "VALUES (?,?,?,?,?,?,?,?)",
                 (combo_id, p["partido"], p.get("liga", ""), p["casa"], p["mercado"],
-                 p["seleccion"], p["cuota"]),
+                 p["seleccion"], p["cuota"], p.get("fecha")),
             )
     return combo_id
 
@@ -192,10 +210,34 @@ def listar_combinadas() -> list[dict]:
 
 
 def marcar_combinada(combo_id: int, estado: str) -> None:
-    """estado: 'usada' | 'descartada' | 'pendiente'."""
+    """estado: 'usada' | 'descartada' | 'pendiente' (¿la jugué?)."""
     assert estado in ("usada", "descartada", "pendiente")
     with _conn() as con:
         con.execute("UPDATE combos SET estado=? WHERE id=?", (estado, combo_id))
+
+
+def marcar_pata_resultado(pick_id: int, resultado: str, detalle: str = "") -> None:
+    """resultado: 'acierto' | 'fallo' | 'anulado' | 'pendiente' (¿pegó?).
+    Distinto de `estado` de la combinada, que es si la jugaste o no."""
+    assert resultado in ("acierto", "fallo", "anulado", "pendiente")
+    with _conn() as con:
+        con.execute(
+            "UPDATE combo_picks SET resultado=?, detalle_resultado=? WHERE id=?",
+            (resultado, detalle, pick_id),
+        )
+
+
+def estado_resultado_combo(combo: dict) -> str:
+    """'ganada' (todas acierto/anulado), 'perdida' (alguna falló),
+    'pendiente' (falta que terminen partidos)."""
+    resultados = [p.get("resultado", "pendiente") for p in combo.get("patas", [])]
+    if not resultados:
+        return "pendiente"
+    if any(r == "fallo" for r in resultados):
+        return "perdida"
+    if all(r in ("acierto", "anulado") for r in resultados):
+        return "ganada"
+    return "pendiente"
 
 
 def eliminar_combinada(combo_id: int) -> None:

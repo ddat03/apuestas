@@ -85,8 +85,13 @@ def _marcador(nombre: str) -> str:
     return re.sub(r"\s", "", m.group(1)) if m else ""
 
 
+_NORDICO = str.maketrans({"ø": "o", "Ø": "o", "æ": "ae", "Æ": "ae", "å": "a", "Å": "a",
+                          "ð": "d", "Ð": "d", "þ": "th", "Þ": "th", "ł": "l", "Ł": "l"})
+
+
 def _tokens(nombre: str) -> set[str]:
-    s = unicodedata.normalize("NFKD", nombre or "").encode("ascii", "ignore").decode().lower()
+    s = (nombre or "").translate(_NORDICO)
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode().lower()
     s = re.sub(r"[^a-z0-9 ]", " ", s)
     toks = []
     for w in s.split():
@@ -130,6 +135,7 @@ class TipPrimatips:
     hora: str          # "HH:MM" en la timezone del server de primatips (UTC)
     tip: str            # "1" | "X" | "2" | "1X" | "12" | "X2" | otro
     odd: float | None   # cuota de ese tip según primatips
+    fecha: str = ""     # "YYYY-MM-DD" del día del partido
     href: str = ""
 
 
@@ -174,9 +180,28 @@ def scrapear_primatips(fecha: str | date | None = None) -> list[TipPrimatips]:
             hora=m_hora.group(1).strip() if m_hora else "",
             tip=m_tip.group(1).strip(),
             odd=odd,
+            fecha=fecha,
             href=m_href.group(1) if m_href else "",
         ))
     return tips
+
+
+def scrapear_primatips_rango(desde: str | date, hasta: str | date) -> list[TipPrimatips]:
+    """Todos los tips entre `desde` y `hasta` (inclusive). Para armar
+    combinadas de varios días, no solo de uno."""
+    d0 = date.fromisoformat(desde) if isinstance(desde, str) else desde
+    d1 = date.fromisoformat(hasta) if isinstance(hasta, str) else hasta
+    if d1 < d0:
+        d0, d1 = d1, d0
+    todos: list[TipPrimatips] = []
+    d = d0
+    while d <= d1:
+        try:
+            todos.extend(scrapear_primatips(d))
+        except requests.RequestException:
+            pass   # un día que falla no tira abajo el rango
+        d += timedelta(days=1)
+    return todos
 
 
 # ────────────────────────────────────────────────────────────
@@ -283,26 +308,21 @@ def _cuota_doble(opciones: dict, tip: str, ec_home: str, ec_away: str) -> tuple[
     return None
 
 
-def cruzar_con_ecuabet(tips: list[TipPrimatips], fecha: str | date,
+def cruzar_con_ecuabet(tips: list[TipPrimatips],
                        ecuabet_ctx: dict, get_mercados_ecuabet) -> list[PataCruzada]:
     """`ecuabet_ctx` y `get_mercados_ecuabet` vienen de analizar_partido
     (se pasan como argumentos para no crear un import circular con el
-    dashboard). `get_mercados_ecuabet(ev, ctx) -> [{"mercado","opciones"}]`."""
-    if isinstance(fecha, str):
-        fecha = date.fromisoformat(fecha)
+    dashboard). `get_mercados_ecuabet(ev, ctx) -> [{"mercado","opciones"}]`.
+    Cada tip lleva su propia `fecha` — así funciona con rangos de varios días."""
     comp = ecuabet_ctx["competidores"]
     eventos = ecuabet_ctx["events"]
 
-    # candidatos de Ecuabet en la misma fecha (± 1 día por timezone)
     candidatos = []
     for ev in eventos:
         ci = ev.get("competitorIds", [])
         if len(ci) != 2:
             continue
-        dt = _dt_ecuabet(ev)
-        if dt is not None and abs((dt.date() - fecha).days) > 1:
-            continue
-        candidatos.append((comp.get(ci[0], "").strip(), comp.get(ci[1], "").strip(), ev, dt))
+        candidatos.append((comp.get(ci[0], "").strip(), comp.get(ci[1], "").strip(), ev, _dt_ecuabet(ev)))
 
     salida: list[PataCruzada] = []
     for tp in tips:
@@ -310,9 +330,16 @@ def cruzar_con_ecuabet(tips: list[TipPrimatips], fecha: str | date,
             salida.append(PataCruzada(tp, False, motivo=f"tip '{tp.tip}' no es 1X2 ni doble oportunidad"))
             continue
 
+        try:
+            f_tip = date.fromisoformat(tp.fecha) if tp.fecha else None
+        except ValueError:
+            f_tip = None
+
         ev_match = next(
             (c for c in candidatos
-             if _mismo_partido(tp.home, tp.away, c[0], c[1]) and _hora_cerca(tp.hora, c[3])),
+             if _mismo_partido(tp.home, tp.away, c[0], c[1])
+             and _hora_cerca(tp.hora, c[3])
+             and (f_tip is None or c[3] is None or abs((c[3].date() - f_tip).days) <= 1)),
             None,
         )
         if not ev_match:
@@ -404,7 +431,7 @@ def main() -> None:
 
     print("Cargando feed de Ecuabet (~30s)...")
     ctx = ap._cargar_ecuabet_raw()
-    cruzadas = cruzar_con_ecuabet(tips, fecha, ctx, ap.get_mercados_ecuabet)
+    cruzadas = cruzar_con_ecuabet(tips, ctx, ap.get_mercados_ecuabet)
     combo = armar_combinada(cruzadas)
 
     print(f"\n=== COMBINADA (O <= {combo.umbral}, en Ecuabet) — {len(combo.patas)} patas ===")
