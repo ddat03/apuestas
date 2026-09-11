@@ -47,6 +47,15 @@ def _ecuabet_cache():
     return ap._cargar_ecuabet_raw()
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _sofascore_ok_cache():
+    """Ping corto cacheado 60s — para distinguir "Sofascore no responde
+    ahora" (red/bloqueo temporal) de "no encontramos a ese equipo" antes
+    de analizar 20-30 patas y que TODAS digan lo mismo sin explicar por
+    qué."""
+    return sc.probar_conexion()
+
+
 @st.cache_data(ttl=600, show_spinner="Cruzando tips con Ecuabet...")
 def _cruzadas_cache(desde_iso: str, hasta_iso: str, _tips, _ecuabet_ctx):
     """El cruce en sí (cruzar_con_ecuabet) es lo caro de esta página —
@@ -219,6 +228,11 @@ analizar = incluidas and col_a.button("🔬 Analizar las tildadas (Sofascore)")
 if analizar:
     st.divider()
     st.subheader("Análisis de las patas elegidas")
+    if not _sofascore_ok_cache():
+        st.warning("⚠️ Sofascore no está respondiendo ahora mismo (red o bloqueo temporal) — por eso las "
+                  "patas de abajo van a salir todas como 'sin datos', no porque esos equipos no existan. "
+                  "Probá de nuevo en unos minutos.")
+        sc.limpiar_cache_equipos()
     st.caption("Tiros/corners/faltas recientes + calidad de rivales + cuota de referencia. "
                "No es una garantía — es lo mismo que hace la pestaña Analizar Partido, aplicado a cada pata.")
     barra = st.progress(0.0)

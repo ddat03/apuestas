@@ -28,6 +28,7 @@
 
 import logging
 import re
+import time
 import unicodedata
 from datetime import datetime, timezone
 
@@ -50,13 +51,37 @@ def _get(path: str) -> dict | None:
     for intento in range(REINTENTOS + 1):
         try:
             r = creq.get(f"{BASE}{path}", impersonate=IMPERSONATE, timeout=TIMEOUT)
-            if r.status_code != 200:
-                return None   # 404/403 no son transitorios — reintentar no ayuda
-            return r.json()
+            if r.status_code == 200:
+                return r.json()
+            # 403 "challenge" de Cloudflare y 429 (rate-limit) SÍ pueden ser
+            # transitorios — visto en la práctica que a veces se resuelven
+            # solos con un pequeño reintento. 404 y el resto de 4xx no, ahí
+            # reintentar no cambia nada.
+            if r.status_code not in (403, 429) or intento == REINTENTOS:
+                return None
+            ultimo_error = f"HTTP {r.status_code}"
         except Exception as e:
             ultimo_error = e
+        if intento < REINTENTOS:
+            time.sleep(1.2 * (intento + 1))
     log.warning(f"{path}: {ultimo_error} (tras {REINTENTOS + 1} intentos)")
     return None
+
+
+def probar_conexion() -> bool:
+    """Ping liviano a Sofascore — para poder avisar 'Sofascore no está
+    respondiendo ahora' de forma clara en vez de que cada equipo por
+    separado diga 'sin datos' sin explicar si es un problema de red o
+    de verdad no se encontró ese equipo."""
+    return _get("/search/all?q=Real+Madrid") is not None
+
+
+def limpiar_cache_equipos() -> None:
+    """Vacía los cachés de buscar_equipo_id/posicion_equipo — para
+    recuperar un equipo que quedó pegado en 'sin datos' por un hipo de
+    red viejo, sin tener que reiniciar todo el dashboard."""
+    _CACHE_EQUIPO_ID.clear()
+    _CACHE_POSICION.clear()
 
 
 _NORDICO = str.maketrans({"ø": "o", "Ø": "o", "æ": "ae", "Æ": "ae", "å": "a", "Å": "a",

@@ -38,6 +38,15 @@ def _partidos_cache():
     return ap.get_partidos()
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _sofascore_ok_cache():
+    """Ping corto y cacheado 60s — así "Sofascore no tiene a uno de los
+    dos equipos" en un equipo real (ej. Boca Juniors) se puede distinguir
+    de "Sofascore no está respondiendo ahora", en vez de que ambos casos
+    se vean idénticos."""
+    return sc.probar_conexion()
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _stats_cache(nombre: str):
     return ap.get_stats_equipo(nombre)
@@ -207,7 +216,14 @@ if col_boton.button("🔄 Recargar partidos", help="Limpia TODO el caché (parti
     _ausencias_cache.clear()
     _evento_id_cache.clear()
     _odds_referencia_cache.clear()
+    _sofascore_ok_cache.clear()
+    sc.limpiar_cache_equipos()
     st.rerun()
+
+if not _sofascore_ok_cache():
+    st.warning("⚠️ Sofascore no está respondiendo ahora (red o bloqueo temporal — no es que el equipo no "
+              "exista) — forma/tabla/H2H/ausencias no van a poder cargar hasta que se recupere. Probá de "
+              "nuevo en unos minutos, o tocá 🔄 Recargar partidos.")
 
 try:
     partidos = _partidos_cache()
@@ -405,7 +421,11 @@ if not picks_este_partido:
     st.caption("Marcá alguna selección con 🔍 arriba para poder analizarla.")
 elif st.button("Analizar", type="primary"):
     if not stats_home.get("equipo_id") or not stats_away.get("equipo_id"):
-        st.warning("Faltan datos de Sofascore de alguno de los dos equipos — no se puede analizar.")
+        if not _sofascore_ok_cache():
+            st.warning("Sofascore no está respondiendo ahora mismo — no es que estos equipos no existan. "
+                      "Esperá un poco y tocá 🔄 Recargar partidos, o probá analizar de nuevo en unos minutos.")
+        else:
+            st.warning("Faltan datos de Sofascore de alguno de los dos equipos — no se puede analizar.")
     else:
         # Calidad de rivales (¿le ganó a alguien de arriba en la tabla o
         # solo a los de abajo?) — se calcula recién acá, solo al pedir el
