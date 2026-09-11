@@ -21,6 +21,7 @@
 #  la base es débil).
 # ============================================================
 
+import math
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -223,15 +224,144 @@ def _mismo_equipo(a: str, b: str) -> bool:
     return na == nb or na in nb or nb in na
 
 
+def _novig_1x2(odds_ref: dict | None) -> dict | None:
+    """Quita el margen a la cuota 1X2 de referencia -> probs que suman 1."""
+    if not odds_ref or any(k not in odds_ref for k in ("local", "empate", "visitante")):
+        return None
+    inv = {k: 1.0 / odds_ref[k] for k in ("local", "empate", "visitante")}
+    s = sum(inv.values())
+    return {k: v / s for k, v in inv.items()} if s else None
+
+
+def _sin_empate(probs: dict | None) -> dict | None:
+    """Reparte 'local'/'visitante' quitando el empate del cálculo — para
+    "Pronóstico sin empate" (Draw No Bet), donde esa opción no existe."""
+    if not probs:
+        return None
+    total = probs.get("local", 0) + probs.get("visitante", 0)
+    if total <= 0:
+        return None
+    return {"local": probs["local"] / total, "visitante": probs["visitante"] / total}
+
+
+def _prom(historial: list[dict], extractor) -> float | None:
+    """Promedio de un campo sobre los partidos que sí lo traen (no todas
+    las ligas de Sofascore tienen xG/tiros cargados) — None si ninguno
+    lo tiene."""
+    vals = [v for v in (extractor(h) for h in historial) if v is not None]
+    return sum(vals) / len(vals) if vals else None
+
+
+def _xg_favor(h: dict) -> float | None:
+    v = h.get("a_favor", {}).get("goles_esperados")
+    return v if v is not None else h.get("goles_favor")
+
+
+def _xg_contra(h: dict) -> float | None:
+    v = h.get("en_contra", {}).get("goles_esperados")
+    return v if v is not None else h.get("goles_contra")
+
+
+def _poisson_pmf(k: int, lam: float) -> float:
+    return math.exp(-lam) * lam ** k / math.factorial(k)
+
+
+def _prob_1x2_por_stats(hist_home: list[dict], hist_away: list[dict]) -> dict | None:
+    """Estimación de 1X2 con un Poisson simple: goles esperados de cada
+    equipo = promedio de su propio xG a favor (o goles reales si esa liga
+    no tiene xG en Sofascore) combinado con lo que el rival concede en
+    promedio. Es la pata "estadística" del veredicto — independiente de
+    cualquier cuota de referencia, así que sigue funcionando en las ligas
+    chicas donde PrimaTips encuentra sus cuotas más bajas y Sofascore no
+    tiene odds de ninguna casa. None si la muestra es muy chica."""
+    if len(hist_home) < MIN_PARTIDOS_CONFIABLE or len(hist_away) < MIN_PARTIDOS_CONFIABLE:
+        return None
+    ataque_h, defensa_h = _prom(hist_home, _xg_favor), _prom(hist_home, _xg_contra)
+    ataque_a, defensa_a = _prom(hist_away, _xg_favor), _prom(hist_away, _xg_contra)
+    if None in (ataque_h, defensa_h, ataque_a, defensa_a):
+        return None
+    lam_h = max(0.15, (ataque_h + defensa_a) / 2)
+    lam_a = max(0.15, (ataque_a + defensa_h) / 2)
+
+    p_local = p_empate = p_visita = 0.0
+    for gh in range(9):
+        for ga in range(9):
+            p = _poisson_pmf(gh, lam_h) * _poisson_pmf(ga, lam_a)
+            if gh > ga:
+                p_local += p
+            elif gh == ga:
+                p_empate += p
+            else:
+                p_visita += p
+    total = p_local + p_empate + p_visita
+    if total <= 0:
+        return None
+    return {"local": p_local / total, "empate": p_empate / total, "visitante": p_visita / total,
+            "goles_esperados_local": round(lam_h, 2), "goles_esperados_visita": round(lam_a, 2)}
+
+
+def _prob_estimada(p_stats: dict | None, p_mercado: dict | None, claves: tuple[str, ...]) -> tuple[float | None, str]:
+    """Combina la probabilidad de stats (Poisson con tiros/goles reales) y
+    la del mercado (no-vig de la cuota de referencia) para la(s) clave(s)
+    pedida(s) — ('local',) para 1X2, ('local','empate') para doble
+    oportunidad 1X. Promedia las dos si están ambas; si falta alguna, usa
+    la que haya; dice siempre de dónde salió el número."""
+    v_s = sum(p_stats[c] for c in claves) if p_stats else None
+    v_m = sum(p_mercado[c] for c in claves) if p_mercado else None
+    if v_s is not None and v_m is not None:
+        return (v_s + v_m) / 2, "tiros/goles recientes + cuota de referencia"
+    if v_s is not None:
+        return v_s, "tiros/goles recientes (sin cuota de referencia para este partido)"
+    if v_m is not None:
+        return v_m, "cuota de referencia (muestra de tiros/goles insuficiente)"
+    return None, ""
+
+
+def _resumen_cifras(nombre: str, historial: list[dict]) -> str | None:
+    """La línea "en cifras" que sostiene la estimación: lo que de verdad
+    pidió Diego — no solo un veredicto, sino ver tiros/corners/faltas
+    reales detrás. None si Sofascore no cargó nada de esto para esta
+    liga (pasa en ligas chicas; ahí solo queda goles)."""
+    xg = _prom(historial, _xg_favor)
+    tiros = _prom(historial, lambda h: h.get("a_favor", {}).get("tiros_arco"))
+    corners = _prom(historial, lambda h: h.get("a_favor", {}).get("corners"))
+    faltas = _prom(historial, lambda h: h.get("a_favor", {}).get("faltas"))
+    partes = []
+    if xg is not None:
+        partes.append(f"{xg:.1f} xG")
+    if tiros is not None:
+        partes.append(f"{tiros:.1f} tiros al arco")
+    if corners is not None:
+        partes.append(f"{corners:.1f} corners")
+    if faltas is not None:
+        partes.append(f"{faltas:.1f} faltas")
+    if not partes:
+        return None
+    return f"{nombre} (últimos {len(historial)} partidos): " + ", ".join(partes) + " por partido, en promedio"
+
+
+def _veredicto_valor(margen: float) -> str:
+    """margen = probabilidad estimada - probabilidad que exige la cuota
+    (1/cuota). Positivo = te pagan más de lo que en teoría vale."""
+    if margen > 0.04:
+        return "✅ CONVIENE — la cuota paga más de lo que debería"
+    if margen < -0.04:
+        return "❌ NO conviene — la cuota paga menos de lo que debería"
+    return "➖ Al límite — la cuota ya refleja bien la probabilidad, ni gana ni pierde valor"
+
+
 def _analizar_ganador(seleccion: str, cuota: float, home: str, away: str,
-                      forma_home, forma_away, ausencias: dict | None, etiqueta_mercado: str,
-                      odds_referencia: dict | None = None) -> Veredicto:
+                      forma_home, forma_away, hist_home: list[dict], hist_away: list[dict],
+                      ausencias: dict | None, etiqueta_mercado: str,
+                      odds_referencia: dict | None = None, sin_empate: bool = False) -> Veredicto:
     """Sirve tanto para 1X2 como para "Pronóstico sin empate" (Draw No
-    Bet). Con odds_referencia (cuota 1X2 de Sofascore/bet365, ver
-    sofascore_client.odds_1x2_evento) da un veredicto real tipo EV —
-    sin eso, o para DNB (donde la referencia de 1X2 no aplica igual),
-    queda en señal cualitativa: forma + ausencias, sin concluir nada
-    por sí sola (eso lo hace mejor sharp_ev.py/combo_builder.py)."""
+    Bet, sin_empate=True). Estima la probabilidad real con un Poisson de
+    tiros/goles recientes (ver _prob_1x2_por_stats) y, si hay cuota de
+    referencia (Sofascore/bet365), la combina con esa — y compara el
+    resultado contra lo que exige tu cuota para decir derecho si conviene
+    o no. Si la muestra es muy chica para ambas fuentes, es honesto: se
+    queda en señal cualitativa (forma + ausencias), sin inventar un
+    veredicto de valor que no puede sostener."""
     es_local = _mismo_equipo(seleccion, home)
     es_visita = not es_local and _mismo_equipo(seleccion, away)
 
@@ -245,6 +375,10 @@ def _analizar_ganador(seleccion: str, cuota: float, home: str, away: str,
 
     lado = "local" if es_local else "visitante"
     partes = []
+    for nombre, hist in ((home, hist_home), (away, hist_away)):
+        r = _resumen_cifras(nombre, hist)
+        if r:
+            partes.append(r)
     f = forma_home if es_local else forma_away
     f_riv = forma_away if es_local else forma_home
     partes.append(f"Forma propia: {f.forma_str or 'N/A'} vs forma rival: {f_riv.forma_str or 'N/A'}")
@@ -254,69 +388,68 @@ def _analizar_ganador(seleccion: str, cuota: float, home: str, away: str,
             nombres = ", ".join(a["nombre"] for a in lado_aus[:3])
             partes.append(f"⚠️ Bajas: {nombres}" + (f" y {len(lado_aus)-3} más" if len(lado_aus) > 3 else ""))
 
-    cuota_ref = (odds_referencia or {}).get(lado)
-    if cuota_ref:
-        prob_ref = 1.0 / cuota_ref
-        prob_ofrecida = 1.0 / cuota
-        margen = prob_ref - prob_ofrecida   # >0 = tu cuota paga más de lo que sugiere la referencia
-        veredicto = ("tu cuota paga bastante más que la referencia — posible valor" if margen > 0.03 else
-                    "tu cuota paga menos o igual que la referencia — sin ventaja aparente" if margen < -0.01 else
-                    "tu cuota está en línea con la referencia")
-        return Veredicto(True,
-                         f"{etiqueta_mercado} — referencia Sofascore/bet365: {cuota_ref} vs tu cuota {cuota} — {veredicto}",
+    p_stats = _prob_1x2_por_stats(hist_home, hist_away)
+    p_mercado = _novig_1x2(odds_referencia)
+    if sin_empate:
+        p_stats, p_mercado = _sin_empate(p_stats), _sin_empate(p_mercado)
+    p_est, fuente = _prob_estimada(p_stats, p_mercado, (lado,))
+
+    if p_est is None:
+        return Veredicto(True, f"{etiqueta_mercado} — muestra de tiros/goles insuficiente para estimar si "
+                                "conviene (menos de 4 partidos recientes con datos de cada equipo) — "
+                                "señal solo cualitativa, no de valor",
                          " | ".join(partes))
 
-    return Veredicto(True, f"{etiqueta_mercado} — señal cualitativa, no de frecuencia (sin cuota de referencia "
-                          "para este partido — eso lo hace mejor sharp_ev.py/combo_builder.py para picks del "
-                          "ciclo automático)",
+    p_ofrecida = 1.0 / cuota
+    margen = p_est - p_ofrecida
+    return Veredicto(True,
+                     f"{etiqueta_mercado} — estimamos ~{p_est:.0%} de que gane {home if es_local else away} "
+                     f"({fuente}) — tu cuota {cuota} necesita que pase el {p_ofrecida:.0%} de las veces para "
+                     f"no perder plata — {_veredicto_valor(margen)}",
                      " | ".join(partes))
 
 
-def _novig_1x2(odds_ref: dict) -> dict | None:
-    """Quita el margen a la cuota 1X2 de referencia -> probs que suman 1."""
-    if not odds_ref or any(k not in odds_ref for k in ("local", "empate", "visitante")):
-        return None
-    inv = {k: 1.0 / odds_ref[k] for k in ("local", "empate", "visitante")}
-    s = sum(inv.values())
-    return {k: v / s for k, v in inv.items()} if s else None
-
-
 def _analizar_doble_chance(tip_code: str, cuota: float, home: str, away: str,
-                           forma_home, forma_away, ausencias: dict | None,
-                           odds_referencia: dict | None) -> Veredicto:
-    """tip_code: '1X' | '12' | 'X2'. La doble oportunidad ya es de por sí
-    alta probabilidad — lo útil es cuánto le pesa la forma en contra y
-    si la cuota de Ecuabet paga de más frente a una estimación justa."""
+                           forma_home, forma_away, hist_home: list[dict], hist_away: list[dict],
+                           ausencias: dict | None, odds_referencia: dict | None) -> Veredicto:
+    """tip_code: '1X' | '12' | 'X2'. Misma estimación Poisson que 1X2,
+    sumando las dos claves que cubre la doble oportunidad."""
     combos = {
-        "1X": ("local", "empate", f"{home} o empate"),
-        "12": ("local", "visitante", f"{home} o {away} (no empate)"),
-        "X2": ("empate", "visitante", f"empate o {away}"),
+        "1X": (("local", "empate"), f"{home} o empate"),
+        "12": (("local", "visitante"), f"{home} o {away} (no empate)"),
+        "X2": (("empate", "visitante"), f"empate o {away}"),
     }
     if tip_code not in combos:
         return Veredicto(False, "Doble oportunidad — código no reconocido", tip_code)
-    a, b, legible = combos[tip_code]
+    claves, legible = combos[tip_code]
 
-    partes = [f"Forma {home}: {forma_home.forma_str or 'N/A'} · Forma {away}: {forma_away.forma_str or 'N/A'}"]
+    partes = []
+    for nombre, hist in ((home, hist_home), (away, hist_away)):
+        r = _resumen_cifras(nombre, hist)
+        if r:
+            partes.append(r)
+    partes.append(f"Forma {home}: {forma_home.forma_str or 'N/A'} · Forma {away}: {forma_away.forma_str or 'N/A'}")
     if ausencias:
         for lado, etiq in (("home", home), ("away", away)):
             baj = ausencias.get(lado, [])
             if baj:
                 partes.append(f"⚠️ Bajas {etiq}: " + ", ".join(x['nombre'] for x in baj[:2]))
 
-    probs = _novig_1x2(odds_referencia)
-    if probs:
-        p_fair = probs[a] + probs[b]
-        p_ofrecida = 1.0 / cuota
-        margen = p_fair - p_ofrecida
-        estado = ("la cuota de Ecuabet paga de más — posible valor" if margen > 0.02 else
-                  "la cuota está en línea con lo justo" if margen > -0.02 else
-                  "la cuota paga de menos — sin ventaja")
-        return Veredicto(True,
-                         f"Doble oportunidad {tip_code} ({legible}) — prob. justa ~{p_fair:.0%}, "
-                         f"tu cuota {cuota} implica {p_ofrecida:.0%} — {estado}",
+    p_stats = _prob_1x2_por_stats(hist_home, hist_away)
+    p_mercado = _novig_1x2(odds_referencia)
+    p_est, fuente = _prob_estimada(p_stats, p_mercado, claves)
+
+    if p_est is None:
+        return Veredicto(True, f"Doble oportunidad {tip_code} ({legible}) — muestra de tiros/goles "
+                                "insuficiente para estimar si conviene — señal solo cualitativa",
                          " | ".join(partes))
+
+    p_ofrecida = 1.0 / cuota
+    margen = p_est - p_ofrecida
     return Veredicto(True,
-                     f"Doble oportunidad {tip_code} ({legible}) — sin cuota de referencia para estimar valor",
+                     f"Doble oportunidad {tip_code} ({legible}) — estimamos ~{p_est:.0%} ({fuente}) — "
+                     f"tu cuota {cuota} necesita que pase el {p_ofrecida:.0%} de las veces para no perder "
+                     f"plata — {_veredicto_valor(margen)}",
                      " | ".join(partes))
 
 
@@ -368,17 +501,21 @@ def analizar_pick(pick: dict, contexto: dict) -> Veredicto:
         codigo = (pick.get("tip") or seleccion).strip().upper()
         return _analizar_doble_chance(codigo, cuota, contexto["home"], contexto["away"],
                                       contexto["forma_home"], contexto["forma_away"],
+                                      contexto["hist_home"], contexto["hist_away"],
                                       contexto.get("ausencias"), contexto.get("odds_referencia"))
 
     if "1x2" in mercado:
         return _analizar_ganador(seleccion, cuota, contexto["home"], contexto["away"],
-                                contexto["forma_home"], contexto["forma_away"], contexto.get("ausencias"), "1X2",
-                                contexto.get("odds_referencia"))
+                                contexto["forma_home"], contexto["forma_away"],
+                                contexto["hist_home"], contexto["hist_away"],
+                                contexto.get("ausencias"), "1X2", contexto.get("odds_referencia"))
 
     if "sin empate" in mercado or "draw no bet" in mercado:
         return _analizar_ganador(seleccion, cuota, contexto["home"], contexto["away"],
-                                contexto["forma_home"], contexto["forma_away"], contexto.get("ausencias"),
-                                "Pronóstico sin empate")
+                                contexto["forma_home"], contexto["forma_away"],
+                                contexto["hist_home"], contexto["hist_away"],
+                                contexto.get("ausencias"), "Pronóstico sin empate",
+                                contexto.get("odds_referencia"), sin_empate=True)
 
     return Veredicto(False, "Sin datos para cruzar este mercado todavía",
                      "No es un error — simplemente no tenemos una fuente estadística mapeada a esta selección")
