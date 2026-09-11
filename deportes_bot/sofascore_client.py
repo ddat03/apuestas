@@ -30,6 +30,7 @@ import logging
 import re
 import unicodedata
 from datetime import datetime, timezone
+from functools import lru_cache
 
 from curl_cffi import requests as creq
 
@@ -87,10 +88,15 @@ def _mismo_equipo(a: str, b: str) -> bool:
     return len(chico) >= 2 and chico <= grande
 
 
+@lru_cache(maxsize=512)
 def buscar_equipo_id(nombre: str) -> int | None:
     """Busca el equipo de fútbol que mejor matchea `nombre`. Sofascore
     ya devuelve los resultados ordenados por relevancia — nos quedamos
-    con el primer resultado tipo "team" de fútbol."""
+    con el primer resultado tipo "team" de fútbol.
+
+    Cacheado en memoria (mismo nombre siempre da el mismo id) — importa
+    sobre todo para calidad_rivales_recientes, que busca el id de cada
+    rival de los últimos partidos y varios picks suelen repetir rival."""
     data = _get(f"/search/all?q={nombre}")
     if not data:
         return None
@@ -330,13 +336,16 @@ def stats_partido(event_id: int) -> dict[str, tuple[int, int]] | None:
     return resultado or None
 
 
+@lru_cache(maxsize=512)
 def posicion_equipo(equipo_id: int) -> dict | None:
     """Posición actual en la tabla — sale del torneo/temporada del
     PRÓXIMO partido del equipo (no del último jugado: a comienzos de
     temporada el último jugado puede ser todavía de la temporada
     anterior, y ahí la tabla que importa es la de la temporada nueva).
     No todos los torneos tienen tabla (ej. copas eliminatorias) — en
-    ese caso devuelve None."""
+    ese caso devuelve None.
+
+    Cacheado en memoria por el mismo motivo que buscar_equipo_id."""
     data = _get(f"/team/{equipo_id}/events/next/0")
     partido = data.get("events", [None])[0] if data and data.get("events") else None
     if not partido:
@@ -496,3 +505,36 @@ def historial_stats_equipo(equipo_id: int, n: int = 5) -> list[dict]:
             "goles_favor": goles_favor, "goles_contra": goles_contra,
         })
     return historial
+
+
+def calidad_rivales_recientes(equipo_id: int, historial: list[dict]) -> dict:
+    """El chequeo que Diego hace a mano: de las victorias en `historial`
+    (viene de historial_stats_equipo), ¿fueron contra rivales mejor
+    posicionados en la tabla, o solo contra los de abajo? Le pide 1
+    request (posicion_equipo, cacheado) por rival distinto que ganó —
+    en la práctica pocos, y varios comparten rival entre home/away.
+
+    {"posicion_propia": int|None, "total_equipos": int|None,
+     "victorias_vs_mejor": [...], "victorias_vs_peor": [...]}
+    — cada entrada: {"rival", "posicion_rival", "marcador"}."""
+    propia = posicion_equipo(equipo_id)
+    victorias_mejor: list[dict] = []
+    victorias_peor: list[dict] = []
+    if not propia:
+        return {"posicion_propia": None, "total_equipos": None,
+                "victorias_vs_mejor": [], "victorias_vs_peor": []}
+
+    for h in historial:
+        gf, gc = h.get("goles_favor"), h.get("goles_contra")
+        if gf is None or gc is None or gf <= gc:
+            continue   # solo interesan las victorias
+        rival = h.get("rival", "")
+        rival_id = buscar_equipo_id(rival) if rival else None
+        pos_rival = posicion_equipo(rival_id) if rival_id else None
+        if not pos_rival:
+            continue
+        entry = {"rival": rival, "posicion_rival": pos_rival["posicion"], "marcador": f"{gf}-{gc}"}
+        (victorias_mejor if pos_rival["posicion"] < propia["posicion"] else victorias_peor).append(entry)
+
+    return {"posicion_propia": propia["posicion"], "total_equipos": propia.get("total_equipos"),
+            "victorias_vs_mejor": victorias_mejor, "victorias_vs_peor": victorias_peor}

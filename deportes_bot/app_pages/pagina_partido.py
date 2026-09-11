@@ -407,8 +407,14 @@ elif st.button("Analizar", type="primary"):
     if not stats_home.get("equipo_id") or not stats_away.get("equipo_id"):
         st.warning("Faltan datos de Sofascore de alguno de los dos equipos — no se puede analizar.")
     else:
+        # Calidad de rivales (¿le ganó a alguien de arriba en la tabla o
+        # solo a los de abajo?) — se calcula recién acá, solo al pedir el
+        # análisis, no en cada carga de página.
+        calidad_home = sc.calidad_rivales_recientes(stats_home["equipo_id"], stats_home["historial"])
+        calidad_away = sc.calidad_rivales_recientes(stats_away["equipo_id"], stats_away["historial"])
+        contexto_analisis = dict(contexto, calidad_home=calidad_home, calidad_away=calidad_away)
         for p in picks_este_partido:
-            v = ma.analizar_pick(p, contexto)
+            v = ma.analizar_pick(p, contexto_analisis)
             with st.container(border=True):
                 st.markdown(f"**{p['mercado']} — {p['seleccion']}** ({p['casa']}, cuota {p['cuota']})")
                 if v.analizable:
@@ -417,3 +423,10 @@ elif st.button("Analizar", type="primary"):
                         st.caption(v.detalle)
                 else:
                     st.info(v.resumen)
+
+        sugerencias = (ma.sugerencias_seguras(elegido["home"], stats_home["historial"]) +
+                      ma.sugerencias_seguras(elegido["away"], stats_away["historial"]))
+        if sugerencias:
+            with st.expander("💡 Otras apuestas a considerar de este partido (sin cuota)"):
+                for s in sugerencias:
+                    st.caption(f"• {s}")

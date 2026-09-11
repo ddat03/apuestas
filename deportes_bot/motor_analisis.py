@@ -350,10 +350,59 @@ def _veredicto_valor(margen: float) -> str:
     return "➖ Al límite — la cuota ya refleja bien la probabilidad, ni gana ni pierde valor"
 
 
+def _texto_calidad_rivales(nombre: str, calidad: dict | None) -> str | None:
+    """El chequeo que Diego hace a mano antes de confiar en una victoria:
+    ¿le ganó a alguien de más arriba en la tabla, o solo a los de abajo?
+    `calidad` viene de sofascore_client.calidad_rivales_recientes —
+    motor_analisis no pega a la red, solo interpreta lo que ya se trajo."""
+    if not calidad or calidad.get("posicion_propia") is None:
+        return None
+    mejor, peor = calidad.get("victorias_vs_mejor", []), calidad.get("victorias_vs_peor", [])
+    pos, total = calidad["posicion_propia"], calidad.get("total_equipos")
+    ubicacion = f"{pos}º" + (f"/{total}" if total else "")
+    if not mejor and not peor:
+        return f"{nombre} está {ubicacion} en su tabla y no viene de ganar ningún partido reciente"
+    if mejor:
+        rivales = ", ".join(f"{v['rival']} ({v['posicion_rival']}º, {v['marcador']})" for v in mejor[:2])
+        extra = f" y {len(mejor)-2} más" if len(mejor) > 2 else ""
+        return (f"{nombre} está {ubicacion} y en sus últimos partidos le ganó a rivales MEJOR posicionados: "
+                f"{rivales}{extra} — señal de confianza real, no solo pegarle a los de abajo")
+    rivales = ", ".join(f"{v['rival']} ({v['posicion_rival']}º, {v['marcador']})" for v in peor[:2])
+    return (f"{nombre} está {ubicacion}, pero sus victorias recientes fueron todas ante rivales PEOR "
+            f"posicionados ({rivales}) — todavía no midió a un rival fuerte, más cautela")
+
+
+def _linea_segura(historial: list[dict], campo: str, etiqueta: str) -> str | None:
+    """Sugiere una línea "menos de X" con margen sobre el promedio
+    reciente — la idea de Diego: no apostar al promedio exacto (4.2 tiros
+    al arco), sino un poco arriba (menos de 5.5), y mostrar qué % de los
+    últimos partidos la habría cumplido. None si no hay dato suficiente."""
+    vals = [v for v in (h.get("a_favor", {}).get(campo) for h in historial) if v is not None]
+    if len(vals) < MIN_PARTIDOS_CONFIABLE:
+        return None
+    prom = sum(vals) / len(vals)
+    linea = math.ceil(prom) + 0.5
+    cumplen = sum(1 for v in vals if v < linea)
+    return (f"menos de {linea:g} {etiqueta} (viene de {prom:.1f} en promedio — cumplió en "
+            f"{cumplen}/{len(vals)} de sus últimos partidos)")
+
+
+def sugerencias_seguras(nombre: str, historial: list[dict]) -> list[str]:
+    """Ideas de apuesta SIN cuota (no sale de ningún libro, solo de la
+    frecuencia reciente) para mercados de tiros/corners/faltas de este
+    equipo puntual — lo que Diego pidió: a partir de "4.2 tiros al arco"
+    sugerir "apostar a menos de 5.5 tiros al arco", no solo mostrar el
+    número. Se buscan después en Ecuabet/1xbet, esto no inventa cuota."""
+    campos = (("tiros_arco", "tiros al arco"), ("corners", "corners"), ("faltas", "faltas"))
+    return [f"{nombre}: {linea}" for campo, etiqueta in campos
+            if (linea := _linea_segura(historial, campo, etiqueta))]
+
+
 def _analizar_ganador(seleccion: str, cuota: float, home: str, away: str,
                       forma_home, forma_away, hist_home: list[dict], hist_away: list[dict],
                       ausencias: dict | None, etiqueta_mercado: str,
-                      odds_referencia: dict | None = None, sin_empate: bool = False) -> Veredicto:
+                      odds_referencia: dict | None = None, sin_empate: bool = False,
+                      calidad_home: dict | None = None, calidad_away: dict | None = None) -> Veredicto:
     """Sirve tanto para 1X2 como para "Pronóstico sin empate" (Draw No
     Bet, sin_empate=True). Estima la probabilidad real con un Poisson de
     tiros/goles recientes (ver _prob_1x2_por_stats) y, si hay cuota de
@@ -387,6 +436,9 @@ def _analizar_ganador(seleccion: str, cuota: float, home: str, away: str,
         if lado_aus:
             nombres = ", ".join(a["nombre"] for a in lado_aus[:3])
             partes.append(f"⚠️ Bajas: {nombres}" + (f" y {len(lado_aus)-3} más" if len(lado_aus) > 3 else ""))
+    txt_calidad = _texto_calidad_rivales(home if es_local else away, calidad_home if es_local else calidad_away)
+    if txt_calidad:
+        partes.append(txt_calidad)
 
     p_stats = _prob_1x2_por_stats(hist_home, hist_away)
     p_mercado = _novig_1x2(odds_referencia)
@@ -411,7 +463,8 @@ def _analizar_ganador(seleccion: str, cuota: float, home: str, away: str,
 
 def _analizar_doble_chance(tip_code: str, cuota: float, home: str, away: str,
                            forma_home, forma_away, hist_home: list[dict], hist_away: list[dict],
-                           ausencias: dict | None, odds_referencia: dict | None) -> Veredicto:
+                           ausencias: dict | None, odds_referencia: dict | None,
+                           calidad_home: dict | None = None, calidad_away: dict | None = None) -> Veredicto:
     """tip_code: '1X' | '12' | 'X2'. Misma estimación Poisson que 1X2,
     sumando las dos claves que cubre la doble oportunidad."""
     combos = {
@@ -434,6 +487,10 @@ def _analizar_doble_chance(tip_code: str, cuota: float, home: str, away: str,
             baj = ausencias.get(lado, [])
             if baj:
                 partes.append(f"⚠️ Bajas {etiq}: " + ", ".join(x['nombre'] for x in baj[:2]))
+    for nombre, calidad in ((home, calidad_home), (away, calidad_away)):
+        txt_calidad = _texto_calidad_rivales(nombre, calidad)
+        if txt_calidad:
+            partes.append(txt_calidad)
 
     p_stats = _prob_1x2_por_stats(hist_home, hist_away)
     p_mercado = _novig_1x2(odds_referencia)
@@ -502,20 +559,23 @@ def analizar_pick(pick: dict, contexto: dict) -> Veredicto:
         return _analizar_doble_chance(codigo, cuota, contexto["home"], contexto["away"],
                                       contexto["forma_home"], contexto["forma_away"],
                                       contexto["hist_home"], contexto["hist_away"],
-                                      contexto.get("ausencias"), contexto.get("odds_referencia"))
+                                      contexto.get("ausencias"), contexto.get("odds_referencia"),
+                                      contexto.get("calidad_home"), contexto.get("calidad_away"))
 
     if "1x2" in mercado:
         return _analizar_ganador(seleccion, cuota, contexto["home"], contexto["away"],
                                 contexto["forma_home"], contexto["forma_away"],
                                 contexto["hist_home"], contexto["hist_away"],
-                                contexto.get("ausencias"), "1X2", contexto.get("odds_referencia"))
+                                contexto.get("ausencias"), "1X2", contexto.get("odds_referencia"),
+                                calidad_home=contexto.get("calidad_home"), calidad_away=contexto.get("calidad_away"))
 
     if "sin empate" in mercado or "draw no bet" in mercado:
         return _analizar_ganador(seleccion, cuota, contexto["home"], contexto["away"],
                                 contexto["forma_home"], contexto["forma_away"],
                                 contexto["hist_home"], contexto["hist_away"],
                                 contexto.get("ausencias"), "Pronóstico sin empate",
-                                contexto.get("odds_referencia"), sin_empate=True)
+                                contexto.get("odds_referencia"), sin_empate=True,
+                                calidad_home=contexto.get("calidad_home"), calidad_away=contexto.get("calidad_away"))
 
     return Veredicto(False, "Sin datos para cruzar este mercado todavía",
                      "No es un error — simplemente no tenemos una fuente estadística mapeada a esta selección")

@@ -61,6 +61,8 @@ def _contexto_pata(home: str, away: str, fecha_iso: str) -> dict | None:
         "hist_home": sh["historial"], "hist_away": sa["historial"],
         "ausencias": sc.ausencias_equipo(ev_id) if ev_id else None,
         "odds_referencia": sc.odds_1x2_evento(ev_id) if ev_id else None,
+        "calidad_home": sc.calidad_rivales_recientes(sh["equipo_id"], sh["historial"]),
+        "calidad_away": sc.calidad_rivales_recientes(sa["equipo_id"], sa["historial"]),
     }
 
 
@@ -72,7 +74,11 @@ rango = c1.date_input(
     min_value=hoy - timedelta(days=3), max_value=hoy + timedelta(days=14),
     help="Elegí una fecha, o un rango (clic en dos días) para combinar varios días.",
 )
-umbral = c2.slider("Cuota máx. por pata (O de PrimaTips)", 1.05, 2.00, 1.30, 0.01)
+umbral_min, umbral = c2.slider(
+    "Rango de cuota por pata (O de PrimaTips)", 1.01, 2.00, (1.05, 1.30), 0.01,
+    help="Los dos extremos se pueden mover — subí el mínimo si no querés las cuotas "
+         "\"casi seguras\" de 1.01-1.04, que suman poco a la cuota total.",
+)
 
 # date_input con value de tupla devuelve (a,) mientras se elige el 2º día, (a,b) al terminar
 if isinstance(rango, (tuple, list)):
@@ -114,20 +120,31 @@ except Exception as e:
     st.stop()
 
 combo = pc.armar_combinada(
-    pc.cruzar_con_ecuabet(tips, ecuabet_ctx, ap.get_mercados_ecuabet), umbral=umbral)
+    pc.cruzar_con_ecuabet(tips, ecuabet_ctx, ap.get_mercados_ecuabet), umbral=umbral, umbral_min=umbral_min)
 
 st.divider()
 
 if not combo.patas:
-    st.warning(f"Ningún tip con O ≤ {umbral} está en Ecuabet para esas fechas. "
-               "Probá subir el umbral o mirar 'No cruzaron' abajo.")
+    st.warning(f"Ningún tip con O entre {umbral_min} y {umbral} está en Ecuabet para esas fechas. "
+               "Probá ampliar el rango o mirar 'No cruzaron' abajo.")
     st.stop()
 
 rango_txt = f"{desde_iso}" + (f" → {hasta_iso}" if hasta_iso != desde_iso else "")
 st.subheader(f"Patas candidatas ({len(combo.patas)}) · {rango_txt} — destildá las que no quieras")
 
+# Checkbox al lado del encabezado "Incluir" para marcar/desmarcar todas
+# de una — sin esto, con 20-30 patas destildar una por una es tedioso.
+if "pt_editor_seed" not in st.session_state:
+    st.session_state["pt_editor_seed"] = 0
+c_chk, c_lbl = st.columns([0.05, 0.95])
+incluir_default = c_chk.checkbox(
+    "todas", value=True, key="pt_check_todas", label_visibility="collapsed",
+    on_change=lambda: st.session_state.update(pt_editor_seed=st.session_state["pt_editor_seed"] + 1),
+)
+c_lbl.caption("☑️ Incluir — tildá/destildá acá para marcar o desmarcar TODAS las patas de una")
+
 df = pd.DataFrame([{
-    "Incluir": True,
+    "Incluir": incluir_default,
     "Fecha": p.tip.fecha,
     "Partido": f"{p.tip.home} vs {p.tip.away}",
     "Liga": p.tip.liga,
@@ -146,7 +163,7 @@ editado = st.data_editor(
         "Cuota Ecuabet": st.column_config.NumberColumn(format="%.3f"),
     },
     disabled=[c for c in df.columns if c != "Incluir"],
-    key="pt_editor",
+    key=f"pt_editor_{st.session_state['pt_editor_seed']}",
 )
 
 incluidas = [combo.patas[i] for i, on in enumerate(editado["Incluir"].fillna(False).tolist()) if on]
@@ -180,8 +197,8 @@ analizar = incluidas and col_a.button("🔬 Analizar las tildadas (Sofascore)")
 if analizar:
     st.divider()
     st.subheader("Análisis de las patas elegidas")
-    st.caption("Forma reciente + bajas + cuota de referencia. No es una garantía — "
-               "es lo mismo que hace la pestaña Analizar Partido, aplicado a cada pata.")
+    st.caption("Tiros/corners/faltas recientes + calidad de rivales + cuota de referencia. "
+               "No es una garantía — es lo mismo que hace la pestaña Analizar Partido, aplicado a cada pata.")
     barra = st.progress(0.0)
     for i, p in enumerate(incluidas, 1):
         barra.progress(i / len(incluidas))
@@ -197,31 +214,44 @@ if analizar:
                 fa = ctx["forma_away"].forma_str or "N/A"
                 st.write(f"Empate — forma {p.tip.home}: {fh} · {p.tip.away}: {fa}. "
                          "El empate a cuota baja es raro; mirá bien esta pata.")
-                continue
-            if p.tip.tip in ("1", "2"):
-                seleccion = ctx["home"] if p.tip.tip == "1" else ctx["away"]
-                pick = {"mercado": "1x2", "seleccion": seleccion, "cuota": p.cuota_ecuabet, "equipo":
-                        "home" if p.tip.tip == "1" else "away"}
-            else:  # 1X / 12 / X2
-                pick = {"mercado": "Doble oportunidad", "seleccion": p.seleccion_ecuabet,
-                        "cuota": p.cuota_ecuabet, "tip": p.tip.tip}
-            v = ma.analizar_pick(pick, ctx)
-            st.write(v.resumen)
-            if v.detalle:
-                st.caption(v.detalle)
+            else:
+                if p.tip.tip in ("1", "2"):
+                    seleccion = ctx["home"] if p.tip.tip == "1" else ctx["away"]
+                    pick = {"mercado": "1x2", "seleccion": seleccion, "cuota": p.cuota_ecuabet, "equipo":
+                            "home" if p.tip.tip == "1" else "away"}
+                else:  # 1X / 12 / X2
+                    pick = {"mercado": "Doble oportunidad", "seleccion": p.seleccion_ecuabet,
+                            "cuota": p.cuota_ecuabet, "tip": p.tip.tip}
+                v = ma.analizar_pick(pick, ctx)
+                st.write(v.resumen)
+                if v.detalle:
+                    st.caption(v.detalle)
+
+            # Sugerencias de OTRAS apuestas seguras (tiros/corners/faltas)
+            # sobre este mismo partido — sin cuota, son para buscarlas
+            # aparte en Ecuabet/1xbet si te interesan.
+            sugerencias = (ma.sugerencias_seguras(p.tip.home, ctx["hist_home"]) +
+                          ma.sugerencias_seguras(p.tip.away, ctx["hist_away"]))
+            if sugerencias:
+                with st.expander("💡 Otras apuestas a considerar de este partido (sin cuota)"):
+                    for s in sugerencias:
+                        st.caption(f"• {s}")
     barra.empty()
 
 # ── Lo que no entró ───────────────────────────────────────
-with st.expander(f"Tips O ≤ {umbral} que NO cruzaron con Ecuabet ({len(combo.no_cruzadas_en_umbral)})"):
+with st.expander(f"Tips O entre {umbral_min} y {umbral} que NO cruzaron con Ecuabet "
+                 f"({len(combo.no_cruzadas_en_umbral)})"):
     if combo.no_cruzadas_en_umbral:
+        st.caption("Se revisó nombre por nombre con alias/variantes conocidas antes de darlos por no "
+                   "encontrados — si alguno de estos SÍ está en Ecuabet con otro nombre, avisá cuál.")
         st.dataframe(pd.DataFrame([{
             "Fecha": p.tip.fecha, "Partido": f"{p.tip.home} vs {p.tip.away}",
             "Liga": p.tip.liga, "Tip (T)": p.tip.tip, "O PrimaTips": p.tip.odd, "Motivo": p.motivo,
         } for p in combo.no_cruzadas_en_umbral]), hide_index=True, width="stretch")
     else:
-        st.caption("Todos los tips en umbral cruzaron.")
+        st.caption("Todos los tips en rango cruzaron.")
 
-with st.expander(f"En Ecuabet pero con O > {umbral} ({len(combo.fuera_umbral)})"):
+with st.expander(f"En Ecuabet pero con O fuera del rango [{umbral_min}, {umbral}] ({len(combo.fuera_umbral)})"):
     if combo.fuera_umbral:
         st.dataframe(pd.DataFrame([{
             "Fecha": p.tip.fecha, "Partido": f"{p.tip.home} vs {p.tip.away}",

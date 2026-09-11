@@ -68,7 +68,7 @@ _STOP = {
 _ALIAS = {
     "utd": "united", "man": "manchester", "dep": "deportivo", "ind": "independiente",
     "atl": "atletico", "intl": "international",
-    "munchen": "munich", "muenchen": "munich", "praga": "prague",
+    "munchen": "munich", "muenchen": "munich", "praga": "prague", "wien": "viena",
 }
 
 # Marcadores que hacen que dos equipos NO sean el mismo aunque el
@@ -101,20 +101,73 @@ def _tokens(nombre: str) -> set[str]:
     return set(toks)
 
 
+def _normalizar_simple(nombre: str) -> str:
+    """Como _tokens pero sin partir en palabras — para comparar contra
+    _EQUIPOS_EQUIVALENTES, que son nombres completos, no bolsas de
+    palabras."""
+    s = (nombre or "").translate(_NORDICO)
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode().lower()
+    s = re.sub(r"[^a-z0-9 ]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+# Pares de nombres que dos fuentes distintas usan para el MISMO club y que
+# el cruce por palabras no puede resolver solo (apodo, ciudad en vez de
+# sigla, idioma distinto — cero palabras en común). Lista corta a
+# propósito: se agranda cuando aparece un caso real que "no cruzó" y se
+# confirma que es el mismo equipo, no se adivina de antemano.
+_EQUIPOS_EQUIVALENTES = [
+    {"sporting cp", "sporting lisboa", "sporting lisbon", "sporting clube de portugal"},
+    {"wolverhampton", "wolverhampton wanderers", "wolves"},
+    {"paris sg", "psg", "paris saint germain", "paris saint-germain"},
+    {"internazionale", "inter milan", "inter", "inter de milan"},
+    {"tottenham", "tottenham hotspur", "spurs"},
+    {"west ham", "west ham united"},
+    {"newcastle", "newcastle united", "newcastle utd"},
+    {"nottingham forest", "nott m forest", "notts forest", "nottm forest"},
+    {"crystal palace", "palace"},
+    {"borussia dortmund", "dortmund", "bvb"},
+    {"borussia monchengladbach", "monchengladbach", "gladbach", "m gladbach"},
+    {"atletico madrid", "atl madrid", "atletico de madrid"},
+    {"athletic bilbao", "athletic club"},
+    {"real sociedad", "la real"},
+    {"olympique lyonnais", "lyon", "ol"},
+    {"olympique marseille", "marseille", "om"},
+    {"corvinul", "hunedoara", "corvinul hunedoara"},
+]
+_EQUIVALENTES_POR_NOMBRE = {n: grupo for grupo in _EQUIPOS_EQUIVALENTES for n in grupo}
+
+
+def _token_coincide(t: str, conjunto: set[str]) -> bool:
+    """Coincidencia difusa entre UN token y un conjunto: exacta, o uno es
+    prefijo del otro con 5+ letras (cubre "antwerp"/"antwerpen",
+    "salzburg"/"salzburgo" — variantes de idioma, no apodos distintos)."""
+    if t in conjunto:
+        return True
+    return any(len(t) >= 5 and len(u) >= 5 and (t.startswith(u) or u.startswith(t)) for u in conjunto)
+
+
 def _mismo_equipo(a: str, b: str) -> bool:
     if _marcador(a) != _marcador(b):
         return False   # filial / femenino vs equipo principal
+
+    grupo = _EQUIVALENTES_POR_NOMBRE.get(_normalizar_simple(a))
+    if grupo and _normalizar_simple(b) in grupo:
+        return True
+
     ta, tb = _tokens(a), _tokens(b)
     if not ta or not tb:
         return False
     if ta == tb:
         return True
     chico, grande = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
-    if chico <= grande:
-        # subconjunto: aceptable si el chico ya tiene 2+ tokens, o si al
-        # grande solo le sobra 1 (típico prefijo/sufijo: "AE", "FC", ciudad)
+    coincide = sum(1 for t in chico if _token_coincide(t, grande))
+    if coincide == len(chico):
+        # todo el chico encaja (exacto o por prefijo): aceptable si ya
+        # tiene 2+ tokens, o si al grande solo le sobra 1 (típico
+        # prefijo/sufijo: "AE", "FC", ciudad)
         return len(chico) >= 2 or (len(grande) - len(chico)) <= 1
-    return len(ta & tb) >= 2
+    return coincide >= 2
 
 
 def _mismo_partido(ph: str, pa: str, eh: str, ea: str) -> bool:
@@ -377,16 +430,20 @@ def cruzar_con_ecuabet(tips: list[TipPrimatips],
 
 @dataclass
 class Combinada:
-    patas: list[PataCruzada] = field(default_factory=list)   # solo en_ecuabet y O <= umbral
+    patas: list[PataCruzada] = field(default_factory=list)   # solo en_ecuabet y umbral_min <= O <= umbral
     fuera_umbral: list[PataCruzada] = field(default_factory=list)
     no_cruzadas: list[PataCruzada] = field(default_factory=list)
     umbral: float = UMBRAL_ODD_DEFAULT
+    umbral_min: float = 1.0
+
+    def _en_rango(self, odd: float | None) -> bool:
+        return odd is not None and self.umbral_min <= odd <= self.umbral
 
     @property
     def no_cruzadas_en_umbral(self) -> list[PataCruzada]:
-        """Las que NO están en Ecuabet pero SÍ tienen O <= umbral —
-        las que 'faltan' para la combinada, no todo el ruido."""
-        return [p for p in self.no_cruzadas if p.tip.odd is not None and p.tip.odd <= self.umbral]
+        """Las que NO están en Ecuabet pero SÍ están en el rango de O
+        elegido — las que 'faltan' para la combinada, no todo el ruido."""
+        return [p for p in self.no_cruzadas if self._en_rango(p.tip.odd)]
 
     @property
     def cuota_total_ecuabet(self) -> float:
@@ -403,12 +460,16 @@ class Combinada:
         return round(total, 3)
 
 
-def armar_combinada(cruzadas: list[PataCruzada], umbral: float = UMBRAL_ODD_DEFAULT) -> Combinada:
-    c = Combinada(umbral=umbral)
+def armar_combinada(cruzadas: list[PataCruzada], umbral: float = UMBRAL_ODD_DEFAULT,
+                    umbral_min: float = 1.0) -> Combinada:
+    """umbral_min/umbral: rango de O de PrimaTips que entra a la
+    combinada — ambos límites, no solo el techo (ej. 1.05-1.30 para
+    dejar afuera los "casi seguros" de 1.01 que no suman cuota)."""
+    c = Combinada(umbral=umbral, umbral_min=umbral_min)
     for p in cruzadas:
         if not p.en_ecuabet:
             c.no_cruzadas.append(p)
-        elif p.tip.odd is not None and p.tip.odd <= umbral:
+        elif c._en_rango(p.tip.odd):
             c.patas.append(p)
         else:
             c.fuera_umbral.append(p)
