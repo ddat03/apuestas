@@ -147,15 +147,25 @@ def _token_coincide(t: str, conjunto: set[str]) -> bool:
     return any(len(t) >= 5 and len(u) >= 5 and (t.startswith(u) or u.startswith(t)) for u in conjunto)
 
 
-def _mismo_equipo(a: str, b: str) -> bool:
-    if _marcador(a) != _marcador(b):
+def _firma(nombre: str) -> tuple[str, frozenset, str]:
+    """Todo lo que _mismo_equipo necesita de UN nombre, calculado una
+    sola vez: (marcador, tokens, forma normalizada simple). cruzar_con_
+    ecuabet compara cada tip contra ~1900 candidatos — sin precalcular
+    esto, se recalculaban los tokens del MISMO candidato de Ecuabet una
+    vez por cada tip (cientos de miles de llamadas de más)."""
+    return (_marcador(nombre), frozenset(_tokens(nombre)), _normalizar_simple(nombre))
+
+
+def _coincide_firmas(fa: tuple, fb: tuple) -> bool:
+    marc_a, ta, simple_a = fa
+    marc_b, tb, simple_b = fb
+    if marc_a != marc_b:
         return False   # filial / femenino vs equipo principal
 
-    grupo = _EQUIVALENTES_POR_NOMBRE.get(_normalizar_simple(a))
-    if grupo and _normalizar_simple(b) in grupo:
+    grupo = _EQUIVALENTES_POR_NOMBRE.get(simple_a)
+    if grupo and simple_b in grupo:
         return True
 
-    ta, tb = _tokens(a), _tokens(b)
     if not ta or not tb:
         return False
     if ta == tb:
@@ -168,6 +178,10 @@ def _mismo_equipo(a: str, b: str) -> bool:
         # prefijo/sufijo: "AE", "FC", ciudad)
         return len(chico) >= 2 or (len(grande) - len(chico)) <= 1
     return coincide >= 2
+
+
+def _mismo_equipo(a: str, b: str) -> bool:
+    return _coincide_firmas(_firma(a), _firma(b))
 
 
 def _mismo_partido(ph: str, pa: str, eh: str, ea: str) -> bool:
@@ -370,12 +384,42 @@ def cruzar_con_ecuabet(tips: list[TipPrimatips],
     comp = ecuabet_ctx["competidores"]
     eventos = ecuabet_ctx["events"]
 
+    # candidatos precalcula la "firma" de cada equipo UNA vez (marcador +
+    # tokens + forma normalizada) en vez de recalcularla en cada
+    # comparación — se compara contra cada tip, y sin esto se repetía el
+    # cálculo de tokens del MISMO candidato cientos de veces por corrida.
     candidatos = []
     for ev in eventos:
         ci = ev.get("competitorIds", [])
         if len(ci) != 2:
             continue
-        candidatos.append((comp.get(ci[0], "").strip(), comp.get(ci[1], "").strip(), ev, _dt_ecuabet(ev)))
+        eh, ea = comp.get(ci[0], "").strip(), comp.get(ci[1], "").strip()
+        candidatos.append((eh, ea, ev, _dt_ecuabet(ev), _firma(eh), _firma(ea)))
+
+    # Además, indexados por fecha — cruzar_con_ecuabet solo acepta partidos
+    # a ±1 día del tip, así que no hace falta escanear los ~1900 candidatos
+    # completos por cada uno de los ~200-400 tips: alcanza con los de esos
+    # 3 días (y los sin fecha, por si acaso). Reduce el cruce de minutos a
+    # segundos con cobertura completa de Ecuabet.
+    por_fecha: dict[str, list] = {}
+    for c in candidatos:
+        clave = c[3].date().isoformat() if c[3] else "?"
+        por_fecha.setdefault(clave, []).append(c)
+
+    def _candidatos_cerca(f_tip: date | None) -> list:
+        if f_tip is None:
+            return candidatos
+        vistos, salida_c = set(), []
+        for d in (-1, 0, 1):
+            for c in por_fecha.get((f_tip + timedelta(days=d)).isoformat(), []):
+                if id(c) not in vistos:
+                    vistos.add(id(c))
+                    salida_c.append(c)
+        for c in por_fecha.get("?", []):
+            if id(c) not in vistos:
+                vistos.add(id(c))
+                salida_c.append(c)
+        return salida_c
 
     salida: list[PataCruzada] = []
     for tp in tips:
@@ -388,9 +432,10 @@ def cruzar_con_ecuabet(tips: list[TipPrimatips],
         except ValueError:
             f_tip = None
 
+        firma_home_tip, firma_away_tip = _firma(tp.home), _firma(tp.away)
         ev_match = next(
-            (c for c in candidatos
-             if _mismo_partido(tp.home, tp.away, c[0], c[1])
+            (c for c in _candidatos_cerca(f_tip)
+             if _coincide_firmas(firma_home_tip, c[4]) and _coincide_firmas(firma_away_tip, c[5])
              and _hora_cerca(tp.hora, c[3])
              and (f_tip is None or c[3] is None or abs((c[3].date() - f_tip).days) <= 1)),
             None,
@@ -399,7 +444,7 @@ def cruzar_con_ecuabet(tips: list[TipPrimatips],
             salida.append(PataCruzada(tp, False, motivo="partido no está en Ecuabet"))
             continue
 
-        eh, ea, ev, _ = ev_match
+        eh, ea, ev, _dt, _fh, _fa = ev_match
         mercados = get_mercados_ecuabet(ev, ecuabet_ctx)
 
         if tp.tip in TIPS_1X2:

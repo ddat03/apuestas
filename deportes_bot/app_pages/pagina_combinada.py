@@ -47,10 +47,32 @@ def _ecuabet_cache():
     return ap._cargar_ecuabet_raw()
 
 
+@st.cache_data(ttl=600, show_spinner="Cruzando tips con Ecuabet...")
+def _cruzadas_cache(desde_iso: str, hasta_iso: str, _tips, _ecuabet_ctx):
+    """El cruce en sí (cruzar_con_ecuabet) es lo caro de esta página —
+    recorre cientos de tips contra ~1900 partidos de Ecuabet. Sin este
+    caché se repetía en CADA interacción de la página (tildar una
+    casilla, mover el slider de cuota, etc.), no solo al cambiar de
+    fecha. Los parámetros con "_" no entran en la clave del caché (así
+    Streamlit no pierde tiempo hasheando listas/diccionarios enormes) —
+    la clave real es solo el rango de fechas, que es lo que de verdad
+    determina el resultado."""
+    return pc.cruzar_con_ecuabet(_tips, _ecuabet_ctx, ap.get_mercados_ecuabet)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _stats_equipo_cache(nombre: str):
+    return ap.get_stats_equipo(nombre)
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def _contexto_pata(home: str, away: str, fecha_iso: str) -> dict | None:
-    sh = ap.get_stats_equipo(home)
-    sa = ap.get_stats_equipo(away)
+    # Cacheado por equipo (no solo por el partido completo) — un mismo
+    # equipo puede aparecer en varias patas tildadas de días distintos,
+    # y sin esto se le pedía la forma/historial a Sofascore de nuevo cada
+    # vez en lugar de reusar lo ya traído.
+    sh = _stats_equipo_cache(home)
+    sa = _stats_equipo_cache(away)
     if not sh["equipo_id"] or not sa["equipo_id"]:
         return None
     ev = sc.buscar_evento_proximo(sh["equipo_id"], away, f"{fecha_iso}T12:00:00Z", ventana_horas=48)
@@ -119,8 +141,8 @@ except Exception as e:
         st.rerun()
     st.stop()
 
-combo = pc.armar_combinada(
-    pc.cruzar_con_ecuabet(tips, ecuabet_ctx, ap.get_mercados_ecuabet), umbral=umbral, umbral_min=umbral_min)
+cruzadas = _cruzadas_cache(desde_iso, hasta_iso, tips, ecuabet_ctx)
+combo = pc.armar_combinada(cruzadas, umbral=umbral, umbral_min=umbral_min)
 
 st.divider()
 

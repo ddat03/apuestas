@@ -30,7 +30,6 @@ import logging
 import re
 import unicodedata
 from datetime import datetime, timezone
-from functools import lru_cache
 
 from curl_cffi import requests as creq
 
@@ -88,22 +87,32 @@ def _mismo_equipo(a: str, b: str) -> bool:
     return len(chico) >= 2 and chico <= grande
 
 
-@lru_cache(maxsize=512)
+_CACHE_EQUIPO_ID: dict[str, int] = {}
+
+
 def buscar_equipo_id(nombre: str) -> int | None:
     """Busca el equipo de fútbol que mejor matchea `nombre`. Sofascore
     ya devuelve los resultados ordenados por relevancia — nos quedamos
     con el primer resultado tipo "team" de fútbol.
 
-    Cacheado en memoria (mismo nombre siempre da el mismo id) — importa
-    sobre todo para calidad_rivales_recientes, que busca el id de cada
-    rival de los últimos partidos y varios picks suelen repetir rival."""
+    Cacheado en memoria — importa sobre todo para calidad_rivales_recientes,
+    que busca el id de cada rival de los últimos partidos y varios picks
+    suelen repetir rival. OJO: solo se cachea un ÉXITO (id encontrado) —
+    un None nunca se guarda, porque casi siempre es un hipo transitorio de
+    red (o el bloqueo temporal de Cloudflare), no que el equipo no exista;
+    cachear el fallo dejaría ese equipo "roto" el resto de la sesión."""
+    if nombre in _CACHE_EQUIPO_ID:
+        return _CACHE_EQUIPO_ID[nombre]
     data = _get(f"/search/all?q={nombre}")
     if not data:
         return None
     for res in data.get("results", []):
         entidad = res.get("entity", {})
         if res.get("type") == "team" and entidad.get("sport", {}).get("id") == 1:
-            return entidad.get("id")
+            equipo_id = entidad.get("id")
+            if equipo_id is not None:
+                _CACHE_EQUIPO_ID[nombre] = equipo_id
+            return equipo_id
     return None
 
 
@@ -336,7 +345,9 @@ def stats_partido(event_id: int) -> dict[str, tuple[int, int]] | None:
     return resultado or None
 
 
-@lru_cache(maxsize=512)
+_CACHE_POSICION: dict[int, dict] = {}
+
+
 def posicion_equipo(equipo_id: int) -> dict | None:
     """Posición actual en la tabla — sale del torneo/temporada del
     PRÓXIMO partido del equipo (no del último jugado: a comienzos de
@@ -345,7 +356,12 @@ def posicion_equipo(equipo_id: int) -> dict | None:
     No todos los torneos tienen tabla (ej. copas eliminatorias) — en
     ese caso devuelve None.
 
-    Cacheado en memoria por el mismo motivo que buscar_equipo_id."""
+    Cacheado en memoria por el mismo motivo que buscar_equipo_id — y con
+    la misma precaución: solo se guarda un resultado real, nunca un None,
+    para que un hipo de red no deje a un equipo "sin tabla" para siempre."""
+    if equipo_id in _CACHE_POSICION:
+        return _CACHE_POSICION[equipo_id]
+
     data = _get(f"/team/{equipo_id}/events/next/0")
     partido = data.get("events", [None])[0] if data and data.get("events") else None
     if not partido:
@@ -363,7 +379,7 @@ def posicion_equipo(equipo_id: int) -> dict | None:
     for grupo in tabla.get("standings", []):
         for fila in grupo.get("rows", []):
             if fila.get("team", {}).get("id") == equipo_id:
-                return {
+                resultado = {
                     "posicion": fila.get("position"),
                     "puntos": fila.get("points"),
                     "jugados": fila.get("matches"),
@@ -372,6 +388,8 @@ def posicion_equipo(equipo_id: int) -> dict | None:
                     "perdidos": fila.get("losses"),
                     "total_equipos": sum(len(g.get("rows", [])) for g in tabla.get("standings", [])),
                 }
+                _CACHE_POSICION[equipo_id] = resultado
+                return resultado
     return None
 
 
