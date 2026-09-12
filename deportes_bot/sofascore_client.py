@@ -46,18 +46,42 @@ REINTENTOS = 2   # Sofascore tira timeouts transitorios de vez en cuando (visto 
                  # equipo real como "sin datos", que parecía un bug y no lo era.
 
 
+COOLDOWN_BLOQUEO = 180   # segundos que se deja de insistir tras un 403 de Cloudflare
+_bloqueado_hasta = 0.0   # time.monotonic() hasta el que _get corta camino sin ni intentar
+
+# Una sola sesión (keep-alive) para todos los pedidos en vez de abrir una
+# conexión TLS nueva por cada uno — analizar 20-30 patas antes hacía
+# decenas de conexiones nuevas en pocos segundos, un patrón bastante "de
+# bot" para cualquier WAF; reusar la conexión lo suaviza.
+_session = creq.Session(impersonate=IMPERSONATE)
+
+
 def _get(path: str) -> dict | None:
+    """OJO con el 403 "challenge" de Cloudflare: NO es como un 429, no
+    conviene reintentarlo en el momento — reintentar durante un bloqueo
+    real solo multiplica los pedidos y lo empeora. Por eso, ante un 403,
+    se activa un "circuit breaker": se corta esta llamada Y se dejan de
+    intentar las siguientes durante COOLDOWN_BLOQUEO segundos (fallan
+    rápido, sin ni golpear la red) — evita seguir empujando un bloqueo
+    que ya sabemos que está activo, y de paso deja de sentirse lento
+    (antes cada pick esperaba 2 reintentos con backoff, todos fallando)."""
+    global _bloqueado_hasta
+    if time.monotonic() < _bloqueado_hasta:
+        return None
+
     ultimo_error = None
     for intento in range(REINTENTOS + 1):
         try:
-            r = creq.get(f"{BASE}{path}", impersonate=IMPERSONATE, timeout=TIMEOUT)
+            r = _session.get(f"{BASE}{path}", timeout=TIMEOUT)
             if r.status_code == 200:
                 return r.json()
-            # 403 "challenge" de Cloudflare y 429 (rate-limit) SÍ pueden ser
-            # transitorios — visto en la práctica que a veces se resuelven
-            # solos con un pequeño reintento. 404 y el resto de 4xx no, ahí
-            # reintentar no cambia nada.
-            if r.status_code not in (403, 429) or intento == REINTENTOS:
+            if r.status_code == 403:
+                _bloqueado_hasta = time.monotonic() + COOLDOWN_BLOQUEO
+                log.warning(f"{path}: 403 challenge de Cloudflare — pausando Sofascore {COOLDOWN_BLOQUEO}s")
+                return None
+            # 429 (rate-limit) sí suele resolverse con un pequeño reintento;
+            # el resto de 4xx (404, etc.) no, ahí insistir no cambia nada.
+            if r.status_code != 429 or intento == REINTENTOS:
                 return None
             ultimo_error = f"HTTP {r.status_code}"
         except Exception as e:
@@ -529,7 +553,9 @@ def historial_stats_equipo(equipo_id: int, n: int = 5) -> list[dict]:
         key=lambda e: e.get("startTimestamp", 0), reverse=True,
     )[:n]
     historial = []
-    for e in partidos:
+    for i, e in enumerate(partidos):
+        if i > 0:
+            time.sleep(0.1)   # pequeño respiro entre partidos — no disparar como ráfaga de bot
         stats = stats_partido(e["id"])
         if not stats:
             continue
@@ -550,12 +576,20 @@ def historial_stats_equipo(equipo_id: int, n: int = 5) -> list[dict]:
     return historial
 
 
+MAX_RIVALES_CALIDAD = 3   # tope de victorias a revisar — cada una le pide 2
+                          # requests más a Sofascore (buscar_equipo_id +
+                          # posicion_equipo); con esto alcanza para la señal
+                          # cualitativa, no hace falta agotar las 5 del historial
+
+
 def calidad_rivales_recientes(equipo_id: int, historial: list[dict]) -> dict:
     """El chequeo que Diego hace a mano: de las victorias en `historial`
     (viene de historial_stats_equipo), ¿fueron contra rivales mejor
     posicionados en la tabla, o solo contra los de abajo? Le pide 1
     request (posicion_equipo, cacheado) por rival distinto que ganó —
-    en la práctica pocos, y varios comparten rival entre home/away.
+    tope MAX_RIVALES_CALIDAD para no multiplicar los pedidos a Sofascore
+    cuando se analizan muchas patas de una — un pequeño respiro (sleep)
+    entre rival y rival, para no verse como una ráfaga de bot.
 
     {"posicion_propia": int|None, "total_equipos": int|None,
      "victorias_vs_mejor": [...], "victorias_vs_peor": [...]}
@@ -567,17 +601,22 @@ def calidad_rivales_recientes(equipo_id: int, historial: list[dict]) -> dict:
         return {"posicion_propia": None, "total_equipos": None,
                 "victorias_vs_mejor": [], "victorias_vs_peor": []}
 
+    revisados = 0
     for h in historial:
+        if revisados >= MAX_RIVALES_CALIDAD:
+            break
         gf, gc = h.get("goles_favor"), h.get("goles_contra")
         if gf is None or gc is None or gf <= gc:
             continue   # solo interesan las victorias
         rival = h.get("rival", "")
         rival_id = buscar_equipo_id(rival) if rival else None
         pos_rival = posicion_equipo(rival_id) if rival_id else None
+        revisados += 1
         if not pos_rival:
             continue
         entry = {"rival": rival, "posicion_rival": pos_rival["posicion"], "marcador": f"{gf}-{gc}"}
         (victorias_mejor if pos_rival["posicion"] < propia["posicion"] else victorias_peor).append(entry)
+        time.sleep(0.1)
 
     return {"posicion_propia": propia["posicion"], "total_equipos": propia.get("total_equipos"),
             "victorias_vs_mejor": victorias_mejor, "victorias_vs_peor": victorias_peor}
